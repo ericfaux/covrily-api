@@ -1,12 +1,9 @@
 // lib/mail.ts
-export async function sendMail(
-  to: string,
-  subject: string,
-  text: string
-): Promise<void> {
+export async function sendMail(to: string, subject: string, text: string): Promise<void> {
   const token = process.env.POSTMARK_TOKEN!;
-  const from = process.env.POSTMARK_FROM!; // e.g. "no-reply@covrily.com"
+  const from = process.env.POSTMARK_FROM!;
   if (!token || !from) throw new Error("Missing POSTMARK_TOKEN or POSTMARK_FROM");
+  if (!to) throw new Error("Missing recipient address (NOTIFY_TO)");
 
   const res = await fetch("https://api.postmarkapp.com/email", {
     method: "POST",
