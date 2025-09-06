@@ -1,25 +1,19 @@
 // /api/inbound.ts
-// Postmark Inbound webhook -> upsert receipt -> create/update deadline
-
+// Robust Postmark Inbound webhook handler
 import type { NextApiRequest, NextApiResponse } from "next";
 import supabaseAdmin from "../lib/supabase-admin";
 import { naiveParse } from "../lib/parse";
 import { computeReturnDeadline } from "../lib/policies";
 
-// --- helpers ---------------------------------------------------------------
-
+// ---------- helpers ----------
 async function readJson(req: NextApiRequest): Promise<any> {
-  // If Next already parsed JSON, use it
   if (req.body && typeof req.body === "object") return req.body;
-
-  // Otherwise read raw and parse
   const raw = await new Promise<string>((resolve, reject) => {
     let buf = "";
     req.on("data", (c) => (buf += c));
     req.on("end", () => resolve(buf));
     req.on("error", reject);
   });
-
   try {
     return JSON.parse(raw || "{}");
   } catch {
@@ -27,20 +21,27 @@ async function readJson(req: NextApiRequest): Promise<any> {
   }
 }
 
-// Postmark puts headers in `Headers: Array<{ Name, Value }>`
+// Postmark stores headers in `Headers: Array<{ Name, Value }>`
 function headerValue(payload: any, name: string): string | undefined {
-  const arr: Array<{ Name?: string; Value?: string }> | undefined =
-    payload?.Headers;
-  return arr?.find((h) => h?.Name?.toLowerCase() === name.toLowerCase())
-    ?.Value;
+  const arr: Array<{ Name?: string; Value?: string }> | undefined = payload?.Headers;
+  return arr?.find((h) => h?.Name?.toLowerCase() === name.toLowerCase())?.Value;
 }
 
-function firstAddress(value?: string): string | undefined {
-  // "A <a@b.com>, C <c@d.com>" -> "a@b.com"
-  if (!value) return undefined;
-  const m =
-    value.match(/<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?/i) || undefined;
+function firstAddress(v?: string): string | undefined {
+  if (!v) return undefined;
+  const m = v.match(/<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?/i);
   return m?.[1];
+}
+
+function sanitizeUuid(s?: string): string | undefined {
+  if (!s) return undefined;
+  const t = s.trim().replace(/^['"<\s]+|['">\s]+$/g, "");
+  return t;
+}
+function isUuid(s?: string): boolean {
+  return !!s?.match(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+  );
 }
 
 function toCents(n?: number | string | null): number | null {
@@ -50,16 +51,8 @@ function toCents(n?: number | string | null): number | null {
   return Math.round(v * 100);
 }
 
-function isUuid(s?: string): boolean {
-  return !!s?.match(
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-  );
-}
-
-// --- handler ---------------------------------------------------------------
-
+// ---------- handler ----------
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  // 1) health check / GET
   if (req.method === "GET" || req.method === "HEAD") {
     return res.status(200).json({ ok: true, info: "inbound webhook ready" });
   }
@@ -67,64 +60,62 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  // 2) parse body safely
   const payload = await readJson(req);
+  console.log("[inbound] received keys:", Object.keys(payload || {}));
 
-  // Minimal debug to Vercel logs (safe keys only)
-  console.log("[inbound] keys:", Object.keys(payload || {}));
+  // 1) user id from MailboxHash or plus-address in To
+  const mailboxHashRaw: string | undefined = payload?.MailboxHash;
+  const toRaw: string | undefined = payload?.To || headerValue(payload, "To");
+  let userId = sanitizeUuid(mailboxHashRaw);
 
-  // 3) derive userId from MailboxHash (the part after + in address)
-  const mailboxHash: string | undefined = payload?.MailboxHash;
-  const toRaw: string | undefined =
-    payload?.To || headerValue(payload, "To"); // for fallback
-
-  // If MailboxHash missing, try to extract +hash from the first "To"
-  let userId = mailboxHash;
   if (!userId) {
     const toEmail = firstAddress(toRaw);
     const plusMatch = toEmail?.match(/\+([^@]+)@/);
-    userId = plusMatch?.[1];
+    userId = sanitizeUuid(plusMatch?.[1]);
   }
-
   if (!isUuid(userId)) {
-    console.error("[inbound] missing/invalid userId (MailboxHash).", {
-      mailboxHash,
+    console.warn("[inbound] ignored — missing/invalid MailboxHash.", {
+      mailboxHashRaw,
       toRaw,
-      userId,
+      parsed: userId,
     });
-    // 200 here so Postmark doesn't keep retrying forever; but we log it.
-    return res
-      .status(200)
-      .json({ ok: true, ignored: true, reason: "missing MailboxHash uuid" });
+    // 200 to avoid retries; nothing we can do without a user id
+    return res.status(200).json({ ok: true, ignored: true, reason: "missing MailboxHash uuid" });
   }
 
-  // 4) collect text & from
-  const textBody: string | undefined =
-    payload?.TextBody ??
-    payload?.HtmlBody ??
-    headerValue(payload, "text") ??
-    headerValue(payload, "body");
+  // 2) text parts
+  const subject: string =
+    payload?.Subject || headerValue(payload, "Subject") || "";
+  const textBody: string =
+    payload?.TextBody ||
+    payload?.HtmlBody ||
+    headerValue(payload, "text") ||
+    "";
 
+  const combinedText = `${subject}\n\n${textBody}`; // gives parser more to work with
+
+  // 3) sender email (merchant hint)
   const fromEmail: string | undefined =
-    payload?.FromFull?.Email ??
-    payload?.From ??
-    headerValue(payload, "From") ??
+    payload?.FromFull?.Email ||
+    payload?.From ||
+    headerValue(payload, "From") ||
     firstAddress(headerValue(payload, "Reply-To"));
 
-  // 5) naive parse -> { merchant, order_id?, purchase_date?, total_cents? }
-  const parsed = naiveParse(textBody || "", fromEmail || "");
+  // 4) naive parse
+  const parsed = naiveParse(combinedText || "", fromEmail || "");
   const merchant =
-    parsed.merchant ||
-    (fromEmail ? String(fromEmail.split("@")[1] || "").toLowerCase() : "unknown");
-
+    (parsed.merchant || (fromEmail?.split("@")[1] ?? "unknown")).toLowerCase();
   const orderId = parsed.order_id ?? "";
   const purchaseDate = parsed.purchase_date ?? null;
   const totalCents =
     parsed.total_cents != null ? parsed.total_cents : toCents(null);
 
-  // 6) upsert receipt
+  console.log("[inbound] parsed", { merchant, orderId, purchaseDate, totalCents });
+
+  // 5) upsert receipt (idempotent); fallback path for unique violations
+  let receiptId: string | undefined;
   try {
-    const { data: upserted, error: upErr } = await supabaseAdmin
+    const { data, error } = await supabaseAdmin
       .from("receipts")
       .upsert(
         [
@@ -132,56 +123,81 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             user_id: userId,
             merchant,
             order_id: orderId || "",
-            purchase_date: purchaseDate, // can be null
+            purchase_date: purchaseDate, // date or null
             total_cents: totalCents,
           },
         ],
-        {
-          onConflict: "user_id,merchant,order_id,purchase_date",
-          ignoreDuplicates: false,
-        }
+        { onConflict: "user_id,merchant,order_id,purchase_date" }
       )
       .select();
 
-    if (upErr) throw upErr;
+    if (error) throw error;
+    receiptId = data?.[0]?.id;
+    console.log("[inbound] upserted receipt", receiptId);
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    console.warn("[inbound] upsert error, attempting select+update", msg);
 
-    const receipt = upserted?.[0];
-    console.log("[inbound] upserted receipt:", receipt?.id, {
-      merchant,
-      orderId,
-      purchaseDate,
-      totalCents,
-    });
+    // Try select existing then update (covers rare mismatch cases)
+    const { data: existing, error: selErr } = await supabaseAdmin
+      .from("receipts")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("merchant", merchant)
+      .eq("order_id", orderId || "")
+      .is("purchase_date", purchaseDate === null ? null : undefined)
+      .eq(purchaseDate !== null ? "purchase_date" : "user_id", purchaseDate ?? userId) // trick to keep types valid
+      .limit(1);
 
-    // 7) compute + upsert deadline (if policy yields a date)
-    const deadlineDate = purchaseDate
-      ? computeReturnDeadline(merchant, purchaseDate)
-      : null;
+    if (selErr) {
+      console.error("[inbound] select fallback failed:", selErr);
+      return res.status(500).json({ ok: false, error: msg });
+    }
 
-    if (deadlineDate) {
+    if (existing && existing.length > 0) {
+      receiptId = existing[0].id;
+      const { error: updErr } = await supabaseAdmin
+        .from("receipts")
+        .update({ total_cents: totalCents })
+        .eq("id", receiptId);
+      if (updErr) {
+        console.error("[inbound] update fallback failed:", updErr);
+        return res.status(500).json({ ok: false, error: String(updErr.message || updErr) });
+      }
+      console.log("[inbound] updated existing receipt", receiptId);
+    } else {
+      console.error("[inbound] could not locate row to update after conflict.");
+      return res.status(500).json({ ok: false, error: msg });
+    }
+  }
+
+  // 6) upsert deadline if a policy applies
+  try {
+    const deadlineDate =
+      purchaseDate ? computeReturnDeadline(merchant, purchaseDate) : null;
+    if (deadlineDate && receiptId) {
       const { error: dlErr } = await supabaseAdmin
         .from("deadlines")
         .upsert(
           [
             {
-              receipt_id: receipt.id,
+              receipt_id: receiptId,
               user_id: userId,
               type: "return",
               status: "open",
               due_at: deadlineDate.toISOString(),
             },
           ],
-          { onConflict: "receipt_id,type", ignoreDuplicates: false }
+          { onConflict: "receipt_id,type" }
         );
       if (dlErr) throw dlErr;
-      console.log("[inbound] upserted deadline for receipt:", receipt.id);
+      console.log("[inbound] upserted deadline for receipt", receiptId);
     } else {
-      console.log("[inbound] no deadline (policy returned null).");
+      console.log("[inbound] no deadline (no policy or no purchase_date).");
     }
   } catch (e: any) {
-    console.error("[inbound] receipts.upsert exception:", e?.message || e);
-    // return 500 so Postmark will retry automatically
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    console.error("[inbound] deadline upsert failed:", e?.message || e);
+    // don't fail the webhook—receipt was created
   }
 
   return res.status(200).json({ ok: true });
