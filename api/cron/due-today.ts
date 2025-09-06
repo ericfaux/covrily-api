@@ -1,29 +1,41 @@
 // api/cron/due-today.ts
 import type { VercelRequest, VercelResponse } from "vercel";
 import { createClient } from "@supabase/supabase-js";
-import { sendMail } from "../../lib/mail"; // <-- correct relative path
+import { sendMail } from "../../lib/mail";
 
 const url = process.env.SUPABASE_URL!;
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const to  = process.env.NOTIFY_TO!; // demo recipient for now
+const fallbackTo = process.env.NOTIFY_TO || "";
+const useFallback = process.env.USE_NOTIFY_TO_FALLBACK === "true";
 
 export default async function handler(_req: VercelRequest, res: VercelResponse) {
   try {
     if (!url || !key) throw new Error("Supabase env not set");
     const supabase = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 
-    // UTC clock (Vercel is UTC by default)
     const now = new Date();
     const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-
-    // Gate re-sends: don't notify if we already mailed in the last 18h
     const todayGate = new Date(now.getTime() - 18 * 60 * 60 * 1000).toISOString();
 
+    type Row = {
+      id: string;
+      due_at: string;
+      receipt_id: string | null;
+      receipts: {
+        user_id: string | null;
+        merchant: string | null;
+        order_id: string | null;
+        purchase_date: string | null;
+        total_cents: number | null;
+      } | null;
+    };
+
+    // 1) Find due-today deadlines
     const { data, error } = await supabase
       .from("deadlines")
       .select(`
-        id, due_at, status, receipt_id,
-        receipts:receipt_id (merchant, order_id, purchase_date, total_cents)
+        id, due_at, status, last_notified_at, receipt_id,
+        receipts:receipt_id ( user_id, merchant, order_id, purchase_date, total_cents )
       `)
       .eq("status", "open")
       .gte("due_at", now.toISOString())
@@ -32,32 +44,60 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
 
     if (error) throw error;
 
-    let sent = 0;
-    for (const d of (data ?? [])) {
-      const r = (d as any).receipts || {};
-      const when = new Date((d as any).due_at);
+    // 2) Resolve emails for the unique user_ids
+    const userIds = Array.from(new Set((data ?? [])
+      .map(r => (r as any).receipts?.user_id)
+      .filter((x): x is string => !!x)));
 
-      const subject = `Reminder: ${(r.merchant ?? "your purchase")} return window ends ${when.toISOString().replace("T", " ").replace(".000Z","Z")}`;
+    const emails = new Map<string, string | null>();
+    if (userIds.length) {
+      const { data: profs, error: e2 } = await supabase
+        .from("profiles")
+        .select("id, email")
+        .in("id", userIds);
+      if (e2) throw e2;
+      for (const p of (profs ?? [])) emails.set((p as any).id, (p as any).email);
+    }
+
+    // 3) Send
+    let sent = 0;
+    for (const d of (data ?? []) as Row[]) {
+      const r = d.receipts ?? ({} as Row["receipts"]);
+      const userId = r?.user_id ?? null;
+      const email = userId ? emails.get(userId) ?? null : null;
+
+      // if no profile email, optionally fall back to NOTIFY_TO
+      const to = email || (useFallback ? fallbackTo : "");
+      if (!to) {
+        // mark as "checked" to avoid re-spam, then continue
+        await supabase.from("deadlines").update({ last_notified_at: new Date().toISOString() }).eq("id", d.id);
+        continue;
+      }
+
+      const when = new Date(d.due_at);
+      const amount = typeof r?.total_cents === "number" ? `$${(r!.total_cents!/100).toFixed(2)}` : "";
+
+      const subject = `Reminder: ${(r?.merchant ?? "your purchase")} return window ends ${when.toISOString().replace("T"," ").replace(".000Z","Z")}`;
       const body =
 `Heads up!
 
-Your ${r.merchant ?? "purchase"} from ${r.purchase_date ?? "unknown"} (${r.total_cents ? `$${(r.total_cents/100).toFixed(2)}` : ""})
+Your ${r?.merchant ?? "purchase"} from ${r?.purchase_date ?? "unknown"} ${amount ? `(${amount})` : ""}
 is approaching the return deadline.
-Deadline (UTC): ${when.toISOString().replace("T", " ").replace(".000Z","Z")}
+Deadline (UTC): ${when.toISOString().replace("T"," ").replace(".000Z","Z")}
 
 Open Covrily to review and decide: return or keep.`;
 
-      await sendMail(to, subject, body);
+      await sendMail(to, subject, body, { debugRouteTo: email || null });
 
       await supabase
         .from("deadlines")
         .update({ last_notified_at: new Date().toISOString() })
-        .eq("id", (d as any).id);
+        .eq("id", d.id);
 
       sent++;
     }
 
-    return res.status(200).json({ ok: true, sent_today: sent });
+    return res.status(200).json({ ok: true, sent_today: sent, users_resolved: userIds.length });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
