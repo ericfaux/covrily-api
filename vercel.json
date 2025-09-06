@@ -1,7 +1,7 @@
 {
   "version": 2,
   "crons": [
-    { "path": "/api/cron/due-today", "schedule": "0 14 * * *" },     // already added
-    { "path": "/api/cron/purge-inbound", "schedule": "0 3 * * 1" }   // Mondays 03:00 UTC
+    { "path": "/api/cron/due-today", "schedule": "0 14 * * *" },
+    { "path": "/api/cron/purge-inbound", "schedule": "0 3 * * 1" }
   ]
 }
