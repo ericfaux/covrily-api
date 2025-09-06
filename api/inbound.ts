@@ -1,160 +1,188 @@
-// api/inbound.ts
-// Postmark Inbound webhook handler (idempotent, defensive).
-// - GET/HEAD return 200 for Postmark "Check" button
-// - POST: store raw inbound, upsert receipt, upsert return deadline
-// - Never 500 due to parse issues; we log & return 200 to stop retries.
+// /api/inbound.ts
+// Postmark Inbound webhook -> upsert receipt -> create/update deadline
 
-import type { VercelRequest, VercelResponse } from "@vercel/node";
+import type { NextApiRequest, NextApiResponse } from "next";
 import supabaseAdmin from "../lib/supabase-admin";
 import { naiveParse } from "../lib/parse";
 import { computeReturnDeadline } from "../lib/policies";
 
-// read raw body if req.body isn't already an object
-async function readRaw(req: any): Promise<string> {
-  return await new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (c: any) => (data += c));
-    req.on("end", () => resolve(data));
+// --- helpers ---------------------------------------------------------------
+
+async function readJson(req: NextApiRequest): Promise<any> {
+  // If Next already parsed JSON, use it
+  if (req.body && typeof req.body === "object") return req.body;
+
+  // Otherwise read raw and parse
+  const raw = await new Promise<string>((resolve, reject) => {
+    let buf = "";
+    req.on("data", (c) => (buf += c));
+    req.on("end", () => resolve(buf));
     req.on("error", reject);
   });
+
+  try {
+    return JSON.parse(raw || "{}");
+  } catch {
+    return {};
+  }
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Allow Postmark "Check" and health probes
+// Postmark puts headers in `Headers: Array<{ Name, Value }>`
+function headerValue(payload: any, name: string): string | undefined {
+  const arr: Array<{ Name?: string; Value?: string }> | undefined =
+    payload?.Headers;
+  return arr?.find((h) => h?.Name?.toLowerCase() === name.toLowerCase())
+    ?.Value;
+}
+
+function firstAddress(value?: string): string | undefined {
+  // "A <a@b.com>, C <c@d.com>" -> "a@b.com"
+  if (!value) return undefined;
+  const m =
+    value.match(/<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?/i) || undefined;
+  return m?.[1];
+}
+
+function toCents(n?: number | string | null): number | null {
+  if (n == null || n === "") return null;
+  const v = typeof n === "number" ? n : parseFloat(String(n).replace(/[^\d.]/g, ""));
+  if (Number.isNaN(v)) return null;
+  return Math.round(v * 100);
+}
+
+function isUuid(s?: string): boolean {
+  return !!s?.match(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+  );
+}
+
+// --- handler ---------------------------------------------------------------
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // 1) health check / GET
   if (req.method === "GET" || req.method === "HEAD") {
     return res.status(200).json({ ok: true, info: "inbound webhook ready" });
   }
-
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  // ---- Parse body safely
-  let body: any = req.body;
-  try {
-    if (!body || typeof body !== "object") {
-      const raw = await readRaw(req);
-      body = raw ? JSON.parse(raw) : {};
-    }
-  } catch (e) {
-    console.error("JSON parse error:", e);
-    // Record inbound attempt then return 200 to avoid retries
-    await supabaseAdmin.from("inbound_emails").insert([
-      { user_id: null, provider: "postmark", payload: { parseError: true } },
-    ]);
-    return res.status(200).json({ ok: false, error: "invalid json" });
+  // 2) parse body safely
+  const payload = await readJson(req);
+
+  // Minimal debug to Vercel logs (safe keys only)
+  console.log("[inbound] keys:", Object.keys(payload || {}));
+
+  // 3) derive userId from MailboxHash (the part after + in address)
+  const mailboxHash: string | undefined = payload?.MailboxHash;
+  const toRaw: string | undefined =
+    payload?.To || headerValue(payload, "To"); // for fallback
+
+  // If MailboxHash missing, try to extract +hash from the first "To"
+  let userId = mailboxHash;
+  if (!userId) {
+    const toEmail = firstAddress(toRaw);
+    const plusMatch = toEmail?.match(/\+([^@]+)@/);
+    userId = plusMatch?.[1];
   }
 
-  // ---- Identify user from MailboxHash (the +<USER_ID> in the inbound address)
-  const mailboxHash = (body?.MailboxHash || "").trim();
-  const user_id = mailboxHash || null;
-
-  // Store the raw inbound for audit/debug no matter what
-  try {
-    const { error: iErr } = await supabaseAdmin.from("inbound_emails").insert([
-      {
-        user_id,
-        provider: "postmark",
-        payload: body ?? {},
-      },
-    ]);
-    if (iErr) console.error("inbound_emails.insert error:", iErr);
-  } catch (e) {
-    console.error("inbound_emails.insert exception:", e);
-  }
-
-  // If we couldn't determine a user, acknowledge and exit (prevents retries)
-  if (!user_id) {
-    return res.status(200).json({ ok: false, info: "missing MailboxHash (user_id)" });
-  }
-
-  // ---- Build a parseable text blob
-  const fromEmail: string = body?.FromFull?.Email || body?.From || "";
-  const subject: string = body?.Subject || "";
-  const textBody: string = body?.TextBody || "";
-  const htmlBody: string = body?.HtmlBody || "";
-  const parseSource = [subject, textBody, htmlBody].join("\n\n");
-
-  // ---- Parse minimal receipt fields
-  const parsed = naiveParse(parseSource, fromEmail);
-  const merchant = (parsed.merchant || "").toLowerCase(); // normalized
-  const order_id = parsed.order_id ?? "";                 // empty string allowed
-  const purchase_date = parsed.purchase_date ?? null;     // 'YYYY-MM-DD' or null
-  const total_cents = parsed.total_cents ?? null;         // number or null
-
-  // If we cannot parse enough to build a reasonable receipt key, just ack
-  if (!merchant || !purchase_date) {
-    console.warn("Parse incomplete; merchant or purchase_date missing", {
-      merchant,
-      purchase_date,
-      subject,
-      fromEmail,
+  if (!isUuid(userId)) {
+    console.error("[inbound] missing/invalid userId (MailboxHash).", {
+      mailboxHash,
+      toRaw,
+      userId,
     });
-    return res.status(200).json({
-      ok: false,
-      info: "parse incomplete (merchant/purchase_date missing)",
-    });
+    // 200 here so Postmark doesn't keep retrying forever; but we log it.
+    return res
+      .status(200)
+      .json({ ok: true, ignored: true, reason: "missing MailboxHash uuid" });
   }
 
-  // ---- Upsert receipt (unique natural key)
-  // Unique constraint in DB: (user_id, merchant, order_id, purchase_date)
-  let receiptId: string | null = null;
+  // 4) collect text & from
+  const textBody: string | undefined =
+    payload?.TextBody ??
+    payload?.HtmlBody ??
+    headerValue(payload, "text") ??
+    headerValue(payload, "body");
+
+  const fromEmail: string | undefined =
+    payload?.FromFull?.Email ??
+    payload?.From ??
+    headerValue(payload, "From") ??
+    firstAddress(headerValue(payload, "Reply-To"));
+
+  // 5) naive parse -> { merchant, order_id?, purchase_date?, total_cents? }
+  const parsed = naiveParse(textBody || "", fromEmail || "");
+  const merchant =
+    parsed.merchant ||
+    (fromEmail ? String(fromEmail.split("@")[1] || "").toLowerCase() : "unknown");
+
+  const orderId = parsed.order_id ?? "";
+  const purchaseDate = parsed.purchase_date ?? null;
+  const totalCents =
+    parsed.total_cents != null ? parsed.total_cents : toCents(null);
+
+  // 6) upsert receipt
   try {
-    const { data, error } = await supabaseAdmin
+    const { data: upserted, error: upErr } = await supabaseAdmin
       .from("receipts")
       .upsert(
         [
           {
-            user_id,
+            user_id: userId,
             merchant,
-            order_id,       // '' is OK (we normalized order_id default in DB)
-            purchase_date,  // e.g., '2025-01-02'
-            total_cents,
+            order_id: orderId || "",
+            purchase_date: purchaseDate, // can be null
+            total_cents: totalCents,
           },
         ],
-        { onConflict: "user_id,merchant,order_id,purchase_date" }
+        {
+          onConflict: "user_id,merchant,order_id,purchase_date",
+          ignoreDuplicates: false,
+        }
       )
-      .select("id")
-      .single();
+      .select();
 
-    if (error) {
-      console.error("receipts.upsert error:", error);
-      // We already stored the raw inbound; ack 200 to stop retries
-      return res.status(200).json({ ok: false, where: "receipts.upsert", error });
-    }
-    receiptId = data?.id ?? null;
-  } catch (e) {
-    console.error("receipts.upsert exception:", e);
-    return res.status(200).json({ ok: false, where: "receipts.upsert", error: String(e) });
-  }
+    if (upErr) throw upErr;
 
-  // ---- Compute & upsert return deadline (unique on receipt_id + type)
-  try {
-    const due = computeReturnDeadline(merchant, purchase_date || "");
-    if (due && receiptId) {
-      const { error: dErr } = await supabaseAdmin
+    const receipt = upserted?.[0];
+    console.log("[inbound] upserted receipt:", receipt?.id, {
+      merchant,
+      orderId,
+      purchaseDate,
+      totalCents,
+    });
+
+    // 7) compute + upsert deadline (if policy yields a date)
+    const deadlineDate = purchaseDate
+      ? computeReturnDeadline(merchant, purchaseDate)
+      : null;
+
+    if (deadlineDate) {
+      const { error: dlErr } = await supabaseAdmin
         .from("deadlines")
         .upsert(
           [
             {
-              receipt_id: receiptId,
+              receipt_id: receipt.id,
+              user_id: userId,
               type: "return",
               status: "open",
-              due_at: due.toISOString(),
+              due_at: deadlineDate.toISOString(),
             },
           ],
-          { onConflict: "receipt_id,type" }
+          { onConflict: "receipt_id,type", ignoreDuplicates: false }
         );
-      if (dErr) {
-        console.error("deadlines.upsert error:", dErr);
-        // Still 200 so Postmark won’t retry endlessly
-        return res.status(200).json({ ok: false, where: "deadlines.upsert", error: dErr });
-      }
+      if (dlErr) throw dlErr;
+      console.log("[inbound] upserted deadline for receipt:", receipt.id);
+    } else {
+      console.log("[inbound] no deadline (policy returned null).");
     }
-  } catch (e) {
-    console.error("deadlines.upsert exception:", e);
-    return res.status(200).json({ ok: false, where: "deadlines.upsert", error: String(e) });
+  } catch (e: any) {
+    console.error("[inbound] receipts.upsert exception:", e?.message || e);
+    // return 500 so Postmark will retry automatically
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 
-  return res.status(200).json({ ok: true, receipt_id: receiptId });
+  return res.status(200).json({ ok: true });
 }
