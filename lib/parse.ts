@@ -8,7 +8,8 @@ export type ParsedReceipt = {
 
 export function naiveParse(text: string, fromEmail: string): ParsedReceipt {
   // Infer merchant from the sender's domain
-  const merchant = fromEmail.split("@")[1]?.split(">")[0]?.trim().toLowerCase() || "unknown";
+  const merchant =
+    fromEmail.split("@")[1]?.split(">")[0]?.trim().toLowerCase() || "unknown";
 
   const orderMatch = text.match(/Order\s?#\s?([0-9\-]+)/i);
   const dateMatch = text.match(
