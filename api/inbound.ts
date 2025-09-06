@@ -1,27 +1,22 @@
 // api/inbound.ts
-// Robust Postmark Inbound webhook: handles GET/HEAD checks and parses body if it's string/buffer/undefined.
-
+// Accepts Postmark Inbound webhook. Always 200 for checks (GET/HEAD or empty body).
 import { supabaseAdmin } from "../lib/supabase-admin";
 import { naiveParse } from "../lib/parse";
 import { computeReturnDeadline } from "../lib/policies";
 
-// Read raw body (for cases where req.body is undefined)
+// Read raw body if req.body is undefined (some runtimes)
 async function readRaw(req: any): Promise<string> {
   return await new Promise((resolve, reject) => {
-    try {
-      let data = "";
-      req.on("data", (chunk: any) => (data += chunk));
-      req.on("end", () => resolve(data));
-      req.on("error", reject);
-    } catch (e) {
-      reject(e);
-    }
+    let data = "";
+    req.on("data", (c: any) => (data += c));
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
   });
 }
 
 export default async function handler(req: any, res: any) {
   try {
-    // Allow Postmark "Check" (GET/HEAD) to succeed
+    // Postmark "Check" often uses GET/HEAD → succeed
     if (req.method !== "POST") {
       return res.status(200).json({ ok: true, info: "inbound webhook ready" });
     }
@@ -30,24 +25,21 @@ export default async function handler(req: any, res: any) {
     let payload: any = req.body;
     if (!payload) {
       const raw = await readRaw(req);
-      try {
-        payload = raw ? JSON.parse(raw) : null;
-      } catch {
-        return res.status(400).json({ error: "Invalid JSON body" });
+      if (!raw) {
+        // Treat empty body as a health check
+        return res.status(200).json({ ok: true, info: "check (no body)" });
+      }
+      try { payload = JSON.parse(raw); } catch {
+        // Also treat invalid JSON as a check
+        return res.status(200).json({ ok: true, info: "check (invalid json)" });
       }
     } else if (typeof payload === "string") {
-      try {
-        payload = JSON.parse(payload);
-      } catch {
-        return res.status(400).json({ error: "Invalid JSON string" });
+      try { payload = JSON.parse(payload); } catch {
+        return res.status(200).json({ ok: true, info: "check (invalid json str)" });
       }
     }
 
-    if (!payload || typeof payload !== "object") {
-      return res.status(400).json({ error: "Missing or invalid JSON body" });
-    }
-
-    // We route by the +<USER_ID> part (MailboxHash)
+    // Real event: must have MailboxHash (the +<USER_ID> part)
     const userId = payload?.MailboxHash?.toString();
     if (!userId) {
       return res.status(400).json({
@@ -59,62 +51,43 @@ export default async function handler(req: any, res: any) {
     const text = payload?.TextBody || "";
     const html = payload?.HtmlBody || "";
 
-    // 1) Store raw inbound (check for FK errors)
+    // 1) Store raw inbound
     const insInbound = await supabaseAdmin.from("inbound_emails").insert({
-      user_id: userId,
-      provider: "postmark",
-      payload
+      user_id: userId, provider: "postmark", payload
     });
     if (insInbound.error) {
       console.error("DB inbound_emails insert error:", insInbound.error);
       return res.status(400).json({ error: "DB inbound_emails", details: insInbound.error.message });
     }
 
-    // 2) Parse → store receipt
+    // 2) Parse → create receipt
     const parsed = naiveParse(text || html, from);
-    const insReceipt = await supabaseAdmin
-      .from("receipts")
-      .insert({
-        user_id: userId,
-        merchant: parsed.merchant,
-        order_id: parsed.order_id,
-        total_cents: parsed.total_cents,
-        purchase_date: parsed.purchase_date,
-        channel: "email",
-        raw_json: payload
-      })
-      .select()
-      .single();
+    const insReceipt = await supabaseAdmin.from("receipts").insert({
+      user_id: userId,
+      merchant: parsed.merchant,
+      order_id: parsed.order_id,
+      total_cents: parsed.total_cents,
+      purchase_date: parsed.purchase_date,
+      channel: "email",
+      raw_json: payload
+    }).select().single();
     if (insReceipt.error) {
       console.error("DB receipts insert error:", insReceipt.error);
       return res.status(400).json({ error: "DB receipts", details: insReceipt.error.message });
     }
-    const receipt = insReceipt.data;
 
     // 3) Optional deadline rule (Best Buy demo)
-    const dueAt =
-      parsed.purchase_date &&
-      computeReturnDeadline(parsed.merchant, parsed.purchase_date);
-
+    const receipt = insReceipt.data;
+    const dueAt = parsed.purchase_date && computeReturnDeadline(parsed.merchant, parsed.purchase_date);
     if (dueAt) {
       const insDeadline = await supabaseAdmin.from("deadlines").insert({
-        user_id: userId,
-        receipt_id: receipt.id,
-        type: "return",
-        due_at: dueAt.toISOString(),
-        status: "open"
+        user_id: userId, receipt_id: receipt.id,
+        type: "return", due_at: dueAt.toISOString(), status: "open"
       });
-      if (insDeadline.error) {
-        console.error("DB deadlines insert error:", insDeadline.error);
-      }
+      if (insDeadline.error) console.error("DB deadlines insert error:", insDeadline.error);
     }
 
-    return res.status(200).json({
-      ok: true,
-      receipt_id: receipt.id,
-      merchant: parsed.merchant,
-      deadline_created: Boolean(dueAt)
-    });
+    return res.status(200).json({ ok: true, receipt_id: receipt.id, deadline_created: Boolean(dueAt) });
   } catch (e: any) {
     console.error("INBOUND_ERROR:", e);
     return res.status(500).json({ error: e.message || "Server error" });
