@@ -1,65 +1,72 @@
+// api/cron/heads-up.ts
+import type { VercelRequest, VercelResponse } from "vercel";
 import { createClient } from "@supabase/supabase-js";
+import { sendMail } from "../../lib/mail";
 
-const FROM = process.env.NOTIFY_FROM_EMAIL || "no-reply@covrily.com";
-const TO   = process.env.NOTIFY_TO_EMAIL   || "eric.faux@covrily.com";
-const POSTMARK_SERVER_TOKEN = process.env.POSTMARK_SERVER_TOKEN!;
+const url = process.env.SUPABASE_URL!;
+const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const to  = process.env.NOTIFY_TO!; // demo recipient for now
 
-function startOfUTC(d = new Date()) { const x = new Date(d); x.setUTCHours(0,0,0,0); return x; }
-function addDaysUTC(d: Date, n: number) { const x = new Date(d); x.setUTCDate(x.getUTCDate()+n); return x; }
-
-async function send(subject: string, text: string) {
-  await fetch("https://api.postmarkapp.com/email", {
-    method: "POST",
-    headers: {
-      "X-Postmark-Server-Token": POSTMARK_SERVER_TOKEN,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ From: FROM, To: TO, Subject: subject, TextBody: text, MessageStream: "outbound" }),
-  });
+function startOfUTC(d = new Date()) {
+  const x = new Date(d);
+  x.setUTCHours(0, 0, 0, 0);
+  return x;
+}
+function addDaysUTC(d: Date, n: number) {
+  const x = new Date(d);
+  x.setUTCDate(x.getUTCDate() + n);
+  return x;
 }
 
-export default async function handler(_req: any, res: any) {
-  const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+export default async function handler(_req: VercelRequest, res: VercelResponse) {
+  try {
+    if (!url || !key) throw new Error("Supabase env not set");
+    const supabase = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 
-  const day7start = startOfUTC(addDaysUTC(new Date(), 7));
-  const day7end   = addDaysUTC(day7start, 1);
+    // 7 full days from now (UTC day boundary)
+    const day7start = startOfUTC(addDaysUTC(new Date(), 7)).toISOString();
+    const day8start = startOfUTC(addDaysUTC(new Date(), 8)).toISOString();
 
-  const { data: due, error } = await supabase
-    .from("deadlines")
-    .select("id, receipt_id, due_at")
-    .eq("status", "open")
-    .gte("due_at", day7start.toISOString())
-    .lt("due_at",  day7end.toISOString())
-    .is("heads_up_notified_at", null);
+    const { data, error } = await supabase
+      .from("deadlines")
+      .select(`
+        id, receipt_id, due_at, status, heads_up_notified_at,
+        receipts:receipt_id (merchant, purchase_date, total_cents)
+      `)
+      .eq("status", "open")
+      .gte("due_at", day7start)
+      .lt("due_at", day8start)
+      .is("heads_up_notified_at", null);
 
-  if (error) return res.status(500).json({ ok: false, error });
-  if (!due?.length) return res.status(200).json({ ok: true, processed: 0 });
+    if (error) throw error;
 
-  const ids = due.map(d => d.receipt_id);
-  const { data: receipts } = await supabase
-    .from("receipts")
-    .select("id, merchant, purchase_date, total_cents")
-    .in("id", ids);
+    let sent = 0;
+    for (const d of (data ?? [])) {
+      const r = (d as any).receipts || {};
+      const when = new Date((d as any).due_at);
+      const amount = r.total_cents ? `$${(r.total_cents/100).toFixed(2)}` : "";
 
-  const recById = new Map((receipts || []).map(r => [r.id, r]));
-  let sent = 0;
+      const subject = `Heads-up: ${(r.merchant || "purchase")} return deadline in 7 days`;
+      const body =
+`Friendly reminder!
 
-  for (const d of due) {
-    const r = recById.get(d.receipt_id);
-    const amount = r?.total_cents ? `$${(r.total_cents/100).toFixed(2)}` : "";
-    const subject = `Heads-up: ${r?.merchant || "purchase"} return deadline in 7 days`;
-    const body = `Friendly reminder!
-
-Your ${r?.merchant ?? "purchase"} from ${r?.purchase_date ?? "unknown"} (${amount}) has a return deadline on ${new Date(d.due_at).toLocaleString()} (in 7 days).
+Your ${r.merchant ?? "purchase"} from ${r.purchase_date ?? "unknown"} (${amount})
+has a return deadline on ${when.toISOString().replace("T", " ").replace(".000Z","Z")} (in ~7 days).
 
 Open Covrily to review and decide: return or keep.`;
 
-    await send(subject, body);
-    await supabase.from("deadlines").update({ heads_up_notified_at: new Date().toISOString() }).eq("id", d.id);
-    sent++;
-  }
+      await sendMail(to, subject, body);
 
-  return res.status(200).json({ ok: true, processed: sent });
+      await supabase
+        .from("deadlines")
+        .update({ heads_up_notified_at: new Date().toISOString() })
+        .eq("id", (d as any).id);
+
+      sent++;
+    }
+
+    return res.status(200).json({ ok: true, processed: sent });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 }
