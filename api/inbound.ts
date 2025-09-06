@@ -1,7 +1,5 @@
 // api/inbound.ts
-// Postmark Inbound webhook handler with dynamic policy lookup.
-// - Always 200 for checks/GET/POST without MailboxHash
-// - On real events: store raw inbound, create receipt, compute deadline from policies.
+// Postmark Inbound webhook with dynamic policy lookup + merchant detection from subject/body.
 
 import { createClient } from "@supabase/supabase-js";
 import { naiveParse } from "../lib/parse";
@@ -15,22 +13,62 @@ type PMInbound = {
   HtmlBody?: string;
   TextBody?: string;
   To?: string;
-  Cc?: string;
-  Bcc?: string;
-  // ...Postmark provides many more fields; we treat the payload as opaque JSON
   [k: string]: any;
 };
 
-// ---- small helpers ----
+// --- merchant helpers ---
+const MERCHANT_ALIASES: Array<{ rx: RegExp; canonical: string }> = [
+  { rx: /\b(best\s*buy|bestbuy\.com)\b/i, canonical: "bestbuy.com" },
+  { rx: /\b(target|target\.com)\b/i, canonical: "target.com" },
+  { rx: /\b(walmart|walmart\.com)\b/i, canonical: "walmart.com" },
+  { rx: /\b(home\s*depot|homedepot\.com)\b/i, canonical: "home depot" },
+  { rx: /\b(costco|costco\.com)\b/i, canonical: "costco" },
+];
+
+const GENERIC_SENDERS = [
+  "gmail.com",
+  "googlemail.com",
+  "outlook.com",
+  "hotmail.com",
+  "live.com",
+  "yahoo.com",
+  "icloud.com",
+  "me.com",
+  "mac.com",
+  "covrily.com",
+];
+
 function baseDomain(s: string | undefined | null): string {
   if (!s) return "";
   const x = s.toLowerCase().trim();
-  // from email like "no-reply@bestbuy.com"
   const m = x.match(/[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})/i);
   const host = m ? m[1] : x;
   const parts = host.replace(/^www\./, "").split(".");
   if (parts.length >= 2) return parts.slice(-2).join(".");
   return host;
+}
+
+function detectMerchant(fromEmail: string, subject: string, body: string): string {
+  const fromDomain = baseDomain(fromEmail);
+
+  // If it's clearly a store domain and not a generic mailbox provider, keep it.
+  if (fromDomain && !GENERIC_SENDERS.includes(fromDomain)) {
+    return fromDomain;
+  }
+
+  // Otherwise try to infer from subject/body keywords
+  const hay = `${subject}\n${body}`.toLowerCase();
+  for (const m of MERCHANT_ALIASES) {
+    if (m.rx.test(hay)) return m.canonical;
+  }
+
+  // Last try: any "something.com" in the body?
+  const dm = hay.match(/\b([a-z0-9-]+\.com)\b/i);
+  if (dm && dm[1] && !GENERIC_SENDERS.includes(dm[1].toLowerCase())) {
+    return dm[1].toLowerCase();
+  }
+
+  return fromDomain || "unknown";
 }
 
 function toDate(input: string | null | undefined): Date | null {
@@ -40,17 +78,12 @@ function toDate(input: string | null | undefined): Date | null {
 }
 
 async function parseJsonBody(req: any): Promise<any | null> {
-  // Vercel/Next may already parse JSON; otherwise read the stream.
   if (req.body && typeof req.body === "object") return req.body;
   return new Promise((resolve) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
     req.on("end", () => {
-      try {
-        resolve(JSON.parse(raw));
-      } catch {
-        resolve(null);
-      }
+      try { resolve(JSON.parse(raw)); } catch { resolve(null); }
     });
     req.on("error", () => resolve(null));
   });
@@ -61,7 +94,6 @@ export default async function handler(req: any, res: any) {
     return res.status(200).json({ ok: true, info: "inbound webhook ready" });
   }
 
-  // Always 200 to keep Postmark happy, even if body is missing (Check button etc.)
   const body = (await parseJsonBody(req)) as PMInbound | null;
   if (!body?.MailboxHash) {
     return res.status(200).json({ ok: true, info: "noop (no MailboxHash)" });
@@ -73,30 +105,26 @@ export default async function handler(req: any, res: any) {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
-  const userId = body.MailboxHash; // We set this in the recipient email as +<USER_ID>
+  const userId = body.MailboxHash;
 
-  // 1) Log raw inbound (audit/debug)
-  const { data: inboundRow, error: inboundErr } = await supabase
-    .from("inbound_emails")
-    .insert({
-      user_id: userId,
-      provider: "postmark",
-      payload: body,
-    })
-    .select("id")
-    .single();
+  // 1) Log raw inbound
+  await supabase.from("inbound_emails").insert({
+    user_id: userId,
+    provider: "postmark",
+    payload: body,
+  });
 
-  if (inboundErr) {
-    console.error("INBOUND_INSERT_ERROR", inboundErr);
-  }
+  // 2) Parse basics
+  const fromAddr = body.FromFull?.Email || body.From || "";
+  const text = (body.TextBody || "") as string;
+  const subj = body.Subject || "";
+  const parsed = naiveParse(text || (body.HtmlBody as string) || "", fromAddr);
 
-  // 2) Parse receipt basics
-  const fromAddr =
-    body.FromFull?.Email || body.From || ""; // e.g., noreply@bestbuy.com
-  const parsed = naiveParse((body.TextBody || body.HtmlBody || "") as string, fromAddr);
-
+  // NEW: smarter merchant detection
   const merchantKey =
-    baseDomain(parsed.merchant) || baseDomain(fromAddr) || "unknown";
+    detectMerchant(fromAddr, subj, `${subj}\n${text}`) ||
+    baseDomain(parsed.merchant) ||
+    "unknown";
 
   const purchaseDate =
     toDate((parsed as any).purchase_date) ||
@@ -127,12 +155,11 @@ export default async function handler(req: any, res: any) {
     return res.status(200).json({ ok: true, info: "receipt insert failed" });
   }
 
-  // 4) Try policy-based deadline from DB (type='return'), fallback to legacy helper
+  // 4) Try policy-based deadline (type='return'), fallback to legacy helper
   let dueAt: Date | null = null;
   let policyId: string | null = null;
 
-  // Find a policy row that matches domain or printable name
-  const { data: polRows, error: polErr } = await supabase
+  const { data: polRows } = await supabase
     .from("policies")
     .select("id, merchant, type, rules")
     .eq("type", "return")
@@ -144,10 +171,6 @@ export default async function handler(req: any, res: any) {
     )
     .limit(1);
 
-  if (polErr) {
-    console.error("POLICY_LOOKUP_ERROR", polErr);
-  }
-
   const policy = polRows && polRows[0] ? polRows[0] : null;
   if (policy && policy.rules && typeof policy.rules.window_days === "number") {
     const d = new Date(purchaseDate);
@@ -155,13 +178,11 @@ export default async function handler(req: any, res: any) {
     dueAt = d;
     policyId = policy.id;
   } else {
-    // Fallback logic from our simple helper (e.g., Best Buy 15 days)
     dueAt = fallbackPolicy(merchantKey, purchaseDate.toISOString().slice(0, 10));
   }
 
-  // 5) Insert (or update) return deadline if we have one
+  // 5) Upsert the return deadline (idempotent)
   if (dueAt) {
-    // idempotency: if an OPEN return deadline exists for this receipt, update it; else insert
     const { data: existing } = await supabase
       .from("deadlines")
       .select("id")
@@ -173,10 +194,7 @@ export default async function handler(req: any, res: any) {
     if (existing?.id) {
       await supabase
         .from("deadlines")
-        .update({
-          due_at: dueAt.toISOString(),
-          source_policy_id: policyId,
-        })
+        .update({ due_at: dueAt.toISOString(), source_policy_id: policyId })
         .eq("id", existing.id);
     } else {
       await supabase.from("deadlines").insert({
