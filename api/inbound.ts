@@ -67,28 +67,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).json({ ok: true, info: "upserted, no id selected" });
   }
 
-  // --- UPSERT RETURN DEADLINE (unique: receipt_id, type)
-  const due = computeReturnDeadline(merchant, purchaseDate || "");
-  if (due) {
-    const { error: dErr } = await supabaseAdmin
-      .from("deadlines")
-      .upsert(
-        [
-          {
-            receipt_id: receiptId,
-            user_id: userId,
-            type: "return",
-            status: "open",
-            due_at: due.toISOString(),
-          },
-        ],
-        { onConflict: "receipt_id,type" }
-      );
+// --- UPSERT RETURN DEADLINE (unique: receipt_id, type)
+const due = computeReturnDeadline(merchant, purchaseDate || "");
+if (due) {
+  const { error: dErr } = await supabaseAdmin
+    .from("deadlines")
+    .upsert(
+      [
+        {
+          receipt_id: receiptId,
+          type: "return",
+          status: "open",
+          due_at: due.toISOString(),
+        },
+      ],
+      { onConflict: "receipt_id,type" }
+    );
 
-    if (dErr) {
-      return res.status(500).json({ ok: false, where: "deadlines.upsert", error: dErr });
-    }
+  if (dErr) {
+    console.error("deadlines.upsert error:", dErr);
+    return res.status(500).json({ ok: false, where: "deadlines.upsert", error: dErr });
   }
-
-  return res.status(200).json({ ok: true, receipt_id: receiptId });
 }
