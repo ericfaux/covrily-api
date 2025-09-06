@@ -6,7 +6,7 @@
     "@supabase/supabase-js": "^2.43.0"
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
-    "@types/node": "^20.11.30"
+    "@types/node": "^20.11.30",
+    "typescript": "^5.4.0"
   }
 }
