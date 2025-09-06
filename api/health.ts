@@ -1,4 +1,4 @@
-import { VercelRequest, VercelResponse } from "@vercel/node";
-export default function handler(_req: VercelRequest, res: VercelResponse) {
+// api/health.ts
+export default function handler(_req: any, res: any) {
   res.status(200).json({ ok: true, service: "covrily-api" });
 }
