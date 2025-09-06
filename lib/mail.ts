@@ -5,7 +5,8 @@ export async function sendMail(
   text: string
 ): Promise<void> {
   const token = process.env.POSTMARK_TOKEN!;
-  const from  = process.env.POSTMARK_FROM!; // e.g. "no-reply@covrily.com"
+  const from = process.env.POSTMARK_FROM!; // e.g. "no-reply@covrily.com"
+  if (!token || !from) throw new Error("Missing POSTMARK_TOKEN or POSTMARK_FROM");
 
   const res = await fetch("https://api.postmarkapp.com/email", {
     method: "POST",
@@ -14,7 +15,13 @@ export async function sendMail(
       "Content-Type": "application/json",
       "X-Postmark-Server-Token": token
     },
-    body: JSON.stringify({ From: from, To: to, Subject: subject, TextBody: text })
+    body: JSON.stringify({
+      From: from,
+      To: to,
+      Subject: subject,
+      TextBody: text,
+      MessageStream: "outbound"
+    })
   });
 
   if (!res.ok) {
