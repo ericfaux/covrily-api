@@ -1,75 +1,68 @@
-// api/cron/due-today.ts
-// Scans deadlines due in the next 24h and emails users once.
-
 import { createClient } from "@supabase/supabase-js";
-import { sendEmail } from "../../lib/postmark";
+
+const FROM = process.env.NOTIFY_FROM_EMAIL || "no-reply@covrily.com";
+const TO   = process.env.NOTIFY_TO_EMAIL   || "eric.faux@covrily.com";
+const POSTMARK_TOKEN = process.env.POSTMARK_SERVER_TOKEN!;
+
+function startOfUTC(d = new Date()) { const x = new Date(d); x.setUTCHours(0,0,0,0); return x; }
+function addDaysUTC(d: Date, n: number) { const x = new Date(d); x.setUTCDate(x.getUTCDate()+n); return x; }
+
+async function send(subject: string, text: string) {
+  await fetch("https://api.postmarkapp.com/email", {
+    method: "POST",
+    headers: {
+      "X-Postmark-Server-Token": POSTMARK_TOKEN,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ From: FROM, To: TO, Subject: subject, TextBody: text, MessageStream: "outbound" }),
+  });
+}
 
 export default async function handler(req: any, res: any) {
-  try {
-    const url = process.env.SUPABASE_URL!;
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-    const supabase = createClient(url, key, { auth: { persistSession: false } });
+  const url = process.env.SUPABASE_URL!;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+  const supabase = createClient(url, key, { auth: { persistSession: false } });
 
-    const now = new Date();
-    const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const start = startOfUTC();
+  const end   = addDaysUTC(start, 1);
 
-    // Find open deadlines due within 24h that we haven't notified yet
-    const { data: due, error } = await supabase
-      .from("deadlines")
-      .select("id,user_id,receipt_id,type,due_at,status,last_notified_at")
-      .eq("status", "open")
-      .is("last_notified_at", null)
-      .lt("due_at", in24h.toISOString());
+  // Only deadlines due TODAY (no overdue), and not yet day-of notified
+  const { data: due } = await supabase
+    .from("deadlines")
+    .select("id, receipt_id, due_at")
+    .eq("status", "open")
+    .gte("due_at", start.toISOString())
+    .lt("due_at",  end.toISOString())
+    .is("last_notified_at", null);
 
-    if (error) throw error;
+  if (!due?.length) return res.status(200).json({ ok: true, processed: 0 });
 
-    const dryRun = String(req.query?.dryRun || "").toLowerCase() === "1";
-    let processed = 0;
+  // Pull receipt details
+  const ids = due.map(d => d.receipt_id);
+  const { data: receipts } = await supabase
+    .from("receipts")
+    .select("id, merchant, purchase_date, total_cents")
+    .in("id", ids);
 
-    for (const d of due || []) {
-      // Get receipt context
-      const { data: receipt } = await supabase
-        .from("receipts")
-        .select("merchant,purchase_date,total_cents,user_id")
-        .eq("id", d.receipt_id)
-        .single();
+  const recById = new Map((receipts||[]).map(r => [r.id, r]));
+  let sent = 0;
 
-      // Get user email using Admin API (service role)
-      const { data: userResp } = await supabase.auth.admin.getUserById(d.user_id);
-      const email = userResp?.user?.email;
-      if (!email) continue;
-
-      const subject =
-        `Reminder: ${receipt?.merchant ?? "your purchase"} ` +
-        `return window ends ${new Date(d.due_at).toLocaleString()}`;
-
-      const amount = receipt?.total_cents != null
-        ? `$${(receipt.total_cents / 100).toFixed(2)}`
-        : "";
-
-      const text =
+  for (const d of due) {
+    const r = recById.get(d.receipt_id);
+    const amount = r?.total_cents ? `$${(r.total_cents/100).toFixed(2)}` : "";
+    const subj = `Reminder: ${r?.merchant || "purchase"} return window ends today`;
+    const body =
 `Heads up!
 
-Your ${receipt?.merchant ?? "purchase"} from ${receipt?.purchase_date ?? "recently"} ${amount ? ` (${amount})` : ""} is approaching the return deadline.
+Your ${r?.merchant ?? "purchase"} from ${r?.purchase_date ?? "unknown"} (${amount}) is approaching the return deadline.
 Deadline: ${new Date(d.due_at).toLocaleString()}.
 
 Open Covrily to review and decide: return or keep.`;
 
-      if (!dryRun) {
-        await sendEmail(email, subject, text);
-        await supabase
-          .from("deadlines")
-          .update({ last_notified_at: new Date().toISOString() })
-          .eq("id", d.id);
-      }
-
-      processed++;
-    }
-
-    return res.status(200).json({ ok: true, processed, dryRun });
-  } catch (e: any) {
-    console.error("CRON_DUE_TODAY_ERROR", e);
-    // Keep returning 200 so cron doesn’t spam retries; use logs to debug
-    return res.status(200).json({ ok: false, error: e?.message || "error" });
+    await send(subj, body);
+    await supabase.from("deadlines").update({ last_notified_at: new Date().toISOString() }).eq("id", d.id);
+    sent++;
   }
+
+  return res.status(200).json({ ok: true, processed: sent });
 }
