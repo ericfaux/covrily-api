@@ -1,13 +1,14 @@
+// lib/parse.ts
 export type ParsedReceipt = {
-  merchant: string;
+  merchant: string;               // domain-like string (e.g., bestbuy.com)
   order_id?: string | null;
-  purchase_date?: string | null; // YYYY-MM-DD or "Jan 2, 2025" accepted
+  purchase_date?: string | null;  // "YYYY-MM-DD" or "Jan 2, 2025" ok
   total_cents?: number | null;
 };
 
 export function naiveParse(text: string, fromEmail: string): ParsedReceipt {
-  // merchant guess from sender domain (fallback)
-  const merchant = fromEmail.split("@")[1]?.split(">")[0]?.trim() || "unknown";
+  // Infer merchant from the sender's domain
+  const merchant = fromEmail.split("@")[1]?.split(">")[0]?.trim().toLowerCase() || "unknown";
 
   const orderMatch = text.match(/Order\s?#\s?([0-9\-]+)/i);
   const dateMatch = text.match(
@@ -19,7 +20,7 @@ export function naiveParse(text: string, fromEmail: string): ParsedReceipt {
     s ? Math.round(parseFloat(s.replace(/,/g, "")) * 100) : null;
 
   return {
-    merchant,
+    merchant,                                      // e.g., "bestbuy.com"
     order_id: orderMatch?.[1] ?? null,
     purchase_date: dateMatch?.[1] ?? null,
     total_cents: toCents(totalMatch?.[1]) ?? null
