@@ -1,5 +1,5 @@
 // api/inbound.ts
-// Postmark Inbound webhook → stores raw email, creates a receipt, and (if applicable) a return deadline.
+// Accepts Postmark Inbound webhook. Also responds 200 to GET/HEAD so the Postmark "Check" passes.
 
 import { supabaseAdmin } from "../lib/supabase-admin";
 import { naiveParse } from "../lib/parse";
@@ -7,18 +7,22 @@ import { computeReturnDeadline } from "../lib/policies";
 
 export default async function handler(req: any, res: any) {
   try {
-    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+    // Allow Postmark's "Check" (often GET or HEAD) to succeed
+    if (req.method !== "POST") {
+      return res.status(200).json({ ok: true, info: "inbound webhook ready" });
+    }
 
-    // Postmark sends JSON. We rely on req.body being a parsed object.
+    // Expect JSON body from Postmark
     const payload = req.body as any;
-    if (!payload) return res.status(400).json({ error: "Missing JSON body" });
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ error: "Missing or invalid JSON body" });
+    }
 
-    // We expect emails to be sent to: abcd+<USER_ID>@inbound.postmarkapp.com
-    // Postmark then places <USER_ID> into `MailboxHash`.
+    // We route by MailboxHash from addresses like: abcd+<USER_ID>@inbound.postmarkapp.com
     const userId = payload?.MailboxHash?.toString();
     if (!userId) {
       return res.status(400).json({
-        error: "Missing MailboxHash. Ensure recipient is abcd+<USER_ID>@inbound.postmarkapp.com"
+        error: "Missing MailboxHash. Use abcd+<USER_ID>@inbound.postmarkapp.com as recipient"
       });
     }
 
@@ -39,7 +43,7 @@ export default async function handler(req: any, res: any) {
       .from("receipts")
       .insert({
         user_id: userId,
-        merchant: parsed.merchant,          // e.g., "bestbuy.com"
+        merchant: parsed.merchant,
         order_id: parsed.order_id,
         total_cents: parsed.total_cents,
         purchase_date: parsed.purchase_date,
@@ -50,7 +54,7 @@ export default async function handler(req: any, res: any) {
       .single();
     if (rErr) throw rErr;
 
-    // 3) Create a return deadline if our simple rule applies
+    // 3) Optional simple deadline rule (Best Buy 15 days)
     const dueAt =
       parsed.purchase_date &&
       computeReturnDeadline(parsed.merchant, parsed.purchase_date);
@@ -67,7 +71,7 @@ export default async function handler(req: any, res: any) {
 
     return res.status(200).json({ ok: true, receipt_id: receipt.id, deadline_created: Boolean(dueAt) });
   } catch (e: any) {
-    console.error(e);
+    console.error("INBOUND_ERROR:", e);
     return res.status(500).json({ error: e.message || "Server error" });
   }
 }
