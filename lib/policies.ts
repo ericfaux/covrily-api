@@ -1,20 +1,19 @@
 // lib/policies.ts
 export type MerchantPolicy = {
-  merchant_aliases: string[];          // names we might see in receipts
+  merchant_aliases: string[];          // names/domains we might see
   return_window_days: number;          // days after purchase to return
   price_adjust_window_days: number;    // days after purchase to request price adjust
-  restocking_fee_pct: number;          // estimated restocking fee (0-100) during allowed returns
+  restocking_fee_pct: number;          // 0–100
   notes?: string;
 };
 
-// ---- MVP rules (assumptions; not legal advice) ----
-// These are simplified defaults so the engine can reason.
-// We can refine them and/or move to DB later.
+// ---- MVP rules (simplified; refine over time) ----
 const POLICIES: MerchantPolicy[] = [
-  { merchant_aliases: ["Best Buy"], return_window_days: 15, price_adjust_window_days: 15, restocking_fee_pct: 0, notes: "Electronics" },
-  { merchant_aliases: ["Target"],   return_window_days: 90, price_adjust_window_days: 14, restocking_fee_pct: 0 },
-  // Amazon generally doesn't do post-purchase price adjustments; treat as 0-day for MVP.
-  { merchant_aliases: ["Amazon"],   return_window_days: 30, price_adjust_window_days: 0,  restocking_fee_pct: 0 },
+  { merchant_aliases: ["Best Buy", "bestbuy.com", "bestbuy"], return_window_days: 15, price_adjust_window_days: 15, restocking_fee_pct: 0, notes: "Electronics" },
+  { merchant_aliases: ["Target", "target.com"],                return_window_days: 90, price_adjust_window_days: 14, restocking_fee_pct: 0 },
+  { merchant_aliases: ["Amazon", "amazon.com"],                return_window_days: 30, price_adjust_window_days: 0,  restocking_fee_pct: 0 },
+  { merchant_aliases: ["Walmart", "walmart.com"],              return_window_days: 90, price_adjust_window_days: 7,  restocking_fee_pct: 0 },
+  { merchant_aliases: ["Home Depot", "homedepot.com"],         return_window_days: 90, price_adjust_window_days: 30, restocking_fee_pct: 0 },
 ];
 
 // Fallback defaults (generic retailer)
