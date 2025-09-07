@@ -4,6 +4,6 @@
     { "path": "/api/cron/due-today", "schedule": "0 14 * * *" },
     { "path": "/api/cron/heads-up",  "schedule": "5 14 * * *" },
     { "path": "/api/cron/purge-inbound", "schedule": "0 3 * * 1" },
-    { "path": "/api/cron/price-watch", "schedule": "0 2 * * *" }   // <— new
+    { "path": "/api/cron/price-watch", "schedule": "0 2 * * *" }  
   ]
 }
