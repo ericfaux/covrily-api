@@ -9,23 +9,36 @@ const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const FALLBACK = process.env.NOTIFY_TO || "";
 const USE_FALLBACK = process.env.USE_NOTIFY_TO_FALLBACK === "true";
+const ALLOW_QUERY_TOKEN = process.env.ALLOW_QUERY_TOKEN === "true";
+
+function authed(req: VercelRequest): boolean {
+  const headerOK = req.headers["x-admin-token"] === ADMIN_TOKEN && !!ADMIN_TOKEN;
+  const queryOK = ALLOW_QUERY_TOKEN && typeof req.query.token === "string" && req.query.token === ADMIN_TOKEN;
+  return headerOK || queryOK;
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (!ADMIN_TOKEN || req.headers["x-admin-token"] !== ADMIN_TOKEN) return res.status(404).end();
-  if (req.method !== "POST") { res.setHeader("Allow", "POST"); return res.status(405).end(); }
+  if (!authed(req)) return res.status(404).end();
 
+  const supabase = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+
+  // Accept GET (browser test) and POST (normal)
+  const method = req.method || "GET";
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-    const receipt_id = body?.receipt_id as string;
-    const current_price_cents = typeof body?.current_price_cents === "number"
-      ? body.current_price_cents
-      : (typeof body?.current_price === "number" ? Math.round(body.current_price * 100) : null);
-    const send = body?.send === true;
+    const q = req.query as any;
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+    const args = method === "GET" ? q : body;
+
+    const receipt_id = String(args.receipt_id || "");
+    const send = args.send === true || args.send === "1" || args.send === 1;
+
+    let current_price_cents: number | null = null;
+    if (args.current_price_cents != null) current_price_cents = parseInt(String(args.current_price_cents), 10);
+    else if (args.current_price != null) current_price_cents = Math.round(parseFloat(String(args.current_price)) * 100);
 
     if (!receipt_id) return res.status(400).json({ ok: false, error: "receipt_id required" });
     if (current_price_cents == null) return res.status(400).json({ ok: false, error: "current_price or current_price_cents required" });
 
-    const supabase = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
     const { data: rec, error } = await supabase
       .from("receipts")
       .select("id, user_id, merchant, order_id, purchase_date, total_cents")
@@ -40,19 +53,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       { current_price_cents }
     );
 
-    let sent = false;
-    let to: string | null = null;
-
+    let sent = false, to: string | null = null;
     if (send) {
-      // resolve user email
       const { data: prof } = await supabase.from("profiles").select("email").eq("id", rec.user_id).single();
       to = prof?.email ?? (USE_FALLBACK ? FALLBACK : null);
-
       if (to) {
         const subject = `Price drop found for ${rec.merchant ?? "your purchase"}`;
         const diff = preview.totals.savings_cents ? `$${(preview.totals.savings_cents / 100).toFixed(2)}` : "";
         const deadline = preview.windows.price_adjust_end_at ?? "unknown";
-
         const text =
 `Good news!
 
@@ -68,7 +76,6 @@ Next steps:
 2) Request a price adjustment referencing your order number.
 
 If you proceed, please reply and we’ll log this decision.`;
-
         await sendMail(to, subject, text, { debugRouteTo: prof?.email || null });
         sent = true;
       }
