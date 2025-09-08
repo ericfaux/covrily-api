@@ -1,5 +1,6 @@
 // api/admin/ui.ts
-import type { VercelRequest, VercelResponse } from "vercel";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const tokenQ = (req.query.token as string) || "";
