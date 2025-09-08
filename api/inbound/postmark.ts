@@ -1,10 +1,10 @@
 // api/inbound/postmark.ts
-import type { VercelRequest, VercelResponse } from "vercel";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import * as crypto from "crypto";
 import { parseHmPdf } from "../../lib/pdf";
 
-export const config = { runtime: "nodejs18.x" };
+export const config = { runtime: "nodejs" }; // <— was "nodejs18.x", which Vercel rejects
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -29,7 +29,6 @@ type PMInbound = {
 function verifySignature(req: VercelRequest): boolean | "skipped" {
   const sig = (req.headers["x-postmark-signature"] as string) || "";
   if (!INBOUND_TOKEN || !sig) return "skipped";
-  // HMAC-SHA256 of the raw JSON body using the token, base64 encoded
   const raw = Buffer.isBuffer((req as any).rawBody)
     ? (req as any).rawBody
     : Buffer.from(JSON.stringify(req.body || {}), "utf8");
@@ -67,7 +66,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const sig = verifySignature(req);
   if (sig !== true) {
     if (sig === "skipped" && ALLOW_UNVERIFIED) {
-      // proceed in dev/test
+      // accept unsigned in test/dev
     } else {
       return res.status(401).json({ ok: false, error: "signature verification failed or missing" });
     }
@@ -83,14 +82,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     (a.ContentType || "").toLowerCase().includes("pdf") ||
     (a.Name || "").toLowerCase().endsWith(".pdf")
   );
-
-  if (!att?.Content) {
-    return res.status(200).json({ ok: true, ignored: true, reason: "no-pdf-attachment" });
-  }
+  if (!att?.Content) return res.status(200).json({ ok: true, ignored: true, reason: "no-pdf-attachment" });
 
   try {
     const pdfBuf = Buffer.from(att.Content, "base64");
-
     const fromDomain = ((payload.From || "").split("@")[1] || "").toLowerCase();
     const merchant = fromDomain.includes("hm.") ? "hm.com" : fromDomain || "unknown";
 
