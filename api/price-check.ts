@@ -1,5 +1,5 @@
 // api/price-check.ts
-import type { VercelRequest, VercelResponse } from "vercel";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import { previewDecision } from "../lib/decision-engine";
 import { sendMail } from "../lib/mail";
