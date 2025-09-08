@@ -1,5 +1,5 @@
 // api/decisions/index.ts
-import type { VercelRequest, VercelResponse } from "vercel";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 
 const url = process.env.SUPABASE_URL!;
