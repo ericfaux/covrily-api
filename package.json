@@ -2,15 +2,14 @@
   "name": "covrily-api",
   "version": "0.1.1",
   "private": true,
-  "engines": {
-    "node": ">=18"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "@supabase/supabase-js": "^2.43.0",
     "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
+    "@vercel/node": "^3.2.8",
     "typescript": "^5.4.0"
   }
 }
