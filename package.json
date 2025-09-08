@@ -1,7 +1,8 @@
 {
   "name": "covrily-api",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
+  "type": "module",
   "engines": { "node": ">=18" },
   "dependencies": {
     "@supabase/supabase-js": "^2.43.0",
