@@ -8,9 +8,10 @@ export const config = { runtime: "nodejs18.x" };
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const INBOUND_TOKEN = process.env.POSTMARK_INBOUND_HOOK_TOKEN || "";
+const INBOUND_TOKEN = process.env.POSTMARK_INBOUND_HOOK_TOKEN || ""; // optional in test
 const RECEIPTS_BUCKET = process.env.RECEIPTS_BUCKET || "receipts";
 const DEFAULT_USER = process.env.INBOUND_DEFAULT_USER_ID || "";
+const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
 
 type PMAddress = { Email?: string; Name?: string; MailboxHash?: string };
 type PMAttachment = { Name?: string; Content?: string; ContentType?: string; ContentLength?: number };
@@ -25,26 +26,22 @@ type PMInbound = {
   Attachments?: PMAttachment[];
 };
 
-function verifySignature(req: VercelRequest): boolean {
-  if (!INBOUND_TOKEN) return false;
+function verifySignature(req: VercelRequest): boolean | "skipped" {
   const sig = (req.headers["x-postmark-signature"] as string) || "";
-  if (!sig) return false;
-  // HMAC-SHA256 of the raw JSON body using the Inbound Hook Token, base64 encoded
+  if (!INBOUND_TOKEN || !sig) return "skipped";
+  // HMAC-SHA256 of the raw JSON body using the token, base64 encoded
   const raw = Buffer.isBuffer((req as any).rawBody)
     ? (req as any).rawBody
     : Buffer.from(JSON.stringify(req.body || {}), "utf8");
   const hmac = crypto.createHmac("sha256", INBOUND_TOKEN).update(raw).digest("base64");
-  // timingSafeEqual avoids timing leaks
   try { return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(sig)); } catch { return false; }
 }
 
 function extractUserId(toFull: PMAddress[] | undefined): string | null {
   for (const r of toFull || []) {
     const email = (r.Email || "").toLowerCase();
-    // abc123+<uuid>@inbound.postmarkapp.com  -> capture uuid
     const m = email.match(/^[^+]+\+([0-9a-f-]{36})@/);
     if (m) return m[1];
-    // Optional: MailboxHash (Postmark captures the +tag here too)
     if (r.MailboxHash && /^[0-9a-f-]{36}$/i.test(r.MailboxHash)) return r.MailboxHash;
   }
   return DEFAULT_USER || null;
@@ -67,8 +64,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).end();
   }
 
-  if (!verifySignature(req)) {
-    return res.status(401).json({ ok: false, error: "signature verification failed" });
+  const sig = verifySignature(req);
+  if (sig !== true) {
+    if (sig === "skipped" && ALLOW_UNVERIFIED) {
+      // proceed in dev/test
+    } else {
+      return res.status(401).json({ ok: false, error: "signature verification failed or missing" });
+    }
   }
 
   const payload = req.body as PMInbound;
@@ -77,7 +79,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
 
-  // Choose the first PDF attachment
   const att = (payload.Attachments || []).find(a =>
     (a.ContentType || "").toLowerCase().includes("pdf") ||
     (a.Name || "").toLowerCase().endsWith(".pdf")
@@ -90,14 +91,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const pdfBuf = Buffer.from(att.Content, "base64");
 
-    // Merchant hint from From domain / Subject
     const fromDomain = ((payload.From || "").split("@")[1] || "").toLowerCase();
     const merchant = fromDomain.includes("hm.") ? "hm.com" : fromDomain || "unknown";
 
-    // Parse H&M PDFs (fallback: try anyway—harmless on non-H&M)
     const preview = await parseHmPdf(pdfBuf);
 
-    // Insert receipt
     const { data: ins, error } = await supabase
       .from("receipts")
       .insert([{
@@ -112,10 +110,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (error || !ins?.id) throw new Error(error?.message || "insert failed");
 
-    // Store the PDF
     let storage_path: string | null = null;
-    try { storage_path = await uploadPdf(supabase, userId, ins.id, att.Name || "receipt.pdf", pdfBuf); }
-    catch (e) { /* non-fatal for MVP */ }
+    try { storage_path = await uploadPdf(supabase, userId, ins.id, att.Name || "receipt.pdf", pdfBuf); } catch {}
 
     return res.status(200).json({
       ok: true,
