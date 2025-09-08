@@ -1,5 +1,5 @@
 // api/cron/price-watch.ts
-import type { VercelRequest, VercelResponse } from "vercel";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import { extractPriceCentsFromHtml } from "../../lib/price-parsers";
 import { previewDecision } from "../../lib/decision-engine";
