@@ -3,9 +3,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import * as crypto from "crypto";
-import { parseHmPdf } from "../../lib/pdf";
+import { parseHmPdf } from "../../lib/pdf.js";
 
-export const config = { runtime: "nodejs" }; // <— was "nodejs18.x", which Vercel rejects
+export const config = { runtime: "nodejs" };// <— was "nodejs18.x", which Vercel rejects
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
