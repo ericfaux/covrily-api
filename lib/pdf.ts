@@ -1,17 +1,17 @@
 // lib/pdf.ts
+import pdfParse from "pdf-parse";
 
-// ——— Utilities ———
 function toCents(v: string | number | null | undefined): number | null {
-  if (v == null) return null;
-  const n = typeof v === "number" ? v : parseFloat(String(v).replace(/[, ]/g, ""));
+  if (v == null || v === "") return null;
+  const n = typeof v === "number" ? v : parseFloat(String(v).replace(/[,\s]/g, ""));
   if (!isFinite(n)) return null;
   return Math.round(n * 100);
 }
 
-function parseDayMonthYear(s: string | null | undefined): Date | null {
+function isoFromDayMonthYear(s?: string | null): string | null {
   if (!s) return null;
-  const d = new Date(s); // JS can parse "25 July 2022"
-  return isNaN(d.getTime()) ? null : d;
+  const d = new Date(s);               // e.g. "25 July 2022"
+  return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 export type PdfIngestPreview = {
@@ -22,61 +22,57 @@ export type PdfIngestPreview = {
   order_date: string | null;   // ISO
   receipt_date: string | null; // ISO
   total_cents: number | null;
-  line_items?: Array<{ desc: string; unit_cents?: number; qty?: number; total_cents?: number }>;
   pages?: number;
   text_excerpt?: string;
+  line_items?: Array<{ desc: string; qty?: number; unit_cents?: number; total_cents?: number }>;
 };
 
+/**
+ * Minimal H&M PDF parser (works for text‑extractable receipts like your example).
+ * IMPORTANT: Never reads local files. Always consumes a Buffer/typed array.
+ */
 export default async function parseHmPdf(
   input: Buffer | Uint8Array | ArrayBuffer
 ): Promise<PdfIngestPreview> {
-  // Dynamic import for stable ESM/CJS interop on Vercel
-  const mod = await import("pdf-parse");
-  const pdfParse: (b: Buffer) => Promise<{ text: string; numpages?: number }> =
-    (mod as any).default ?? (mod as any);
-
-  const buf = Buffer.isBuffer(input)
-    ? input
-    : Buffer.from(input instanceof ArrayBuffer ? new Uint8Array(input) : input);
-
+  // Normalize to a Node Buffer
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(input as any);
   const parsed = await pdfParse(buf);
-  const text = parsed.text || "";
-  const t = text.replace(/\r/g, "").replace(/[ \t]+/g, " ").trim();
 
-  const mOrder       = t.match(/ORDER NUMBER\s+([A-Z0-9\-]+)/i);
-  const mReceipt     = t.match(/RECEIPT NUMBER\s+([A-Z0-9\-]+)/i);
-  const mReceiptDate = t.match(/RECEIPT DATE\s+(\d{1,2} [A-Za-z]+ \d{4})/i);
-  const mOrderDate   = t.match(/ORDER DATE\s+(\d{1,2} [A-Za-z]+ \d{4})/i);
-  const mTotal       = t.match(/TOTAL[: ]+\$?\s*([0-9]+(?:\.[0-9]{2})?)/i);
+  const text = (parsed.text || "")
+    .replace(/\r/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .trim();
 
-  const lines: Array<{ desc: string; unit_cents?: number; qty?: number; total_cents?: number }> = [];
-  const itemRegex = /([A-Za-z0-9\- ]+?Shirt[A-Za-z0-9\- ]*)[^$]*\$([0-9]+\.[0-9]{2})/gi;
+  // Heuristics
+  const mOrder        = text.match(/ORDER NUMBER\s+([A-Z0-9\-]+)/i);
+  const mReceiptNo    = text.match(/RECEIPT NUMBER\s+([A-Z0-9\-]+)/i);
+  const mOrderDate    = text.match(/ORDER DATE\s+(\d{1,2} [A-Za-z]+ \d{4})/i);
+  const mReceiptDate  = text.match(/RECEIPT DATE\s+(\d{1,2} [A-Za-z]+ \d{4})/i);
+  const mTotal        = text.match(/TOTAL[: ]+\$?\s*([0-9]+(?:\.[0-9]{2})?)/i);
+
+  // Optional line‑items (very rough, keeps UI interesting for now)
+  const items: Array<{ desc: string; qty?: number; unit_cents?: number; total_cents?: number }> = [];
+  const itemRegex = /([A-Za-z0-9][A-Za-z0-9 .\-']{8,})\s+(\d+)\s*\$([0-9]+\.[0-9]{2})/g;
   let m: RegExpExecArray | null;
-  while ((m = itemRegex.exec(t)) !== null) {
-    lines.push({
+  while ((m = itemRegex.exec(text)) !== null) {
+    items.push({
       desc: m[1].trim(),
-      unit_cents: toCents(m[2]) ?? undefined,
-      qty: 1,
-      total_cents: toCents(m[2]) ?? undefined,
+      qty: parseInt(m[2], 10) || 1,
+      unit_cents: toCents(m[3]) ?? undefined,
+      total_cents: toCents(m[3]) ?? undefined,
     });
   }
-
-  const order_number  = mOrder?.[1] ?? null;
-  const receipt_number= mReceipt?.[1] ?? null;
-  const order_date    = parseDayMonthYear(mOrderDate?.[1])?.toISOString() ?? null;
-  const receipt_date  = parseDayMonthYear(mReceiptDate?.[1])?.toISOString() ?? null;
-  const total_cents   = toCents(mTotal?.[1] ?? null);
 
   return {
     ok: true,
     merchant: "hm.com",
-    order_number,
-    receipt_number,
-    order_date,
-    receipt_date,
-    total_cents,
-    line_items: lines.length ? lines : undefined,
-    pages: (parsed as any).numpages ?? undefined,
-    text_excerpt: t.slice(0, 800),
+    order_number:   mOrder?.[1] ?? null,
+    receipt_number: mReceiptNo?.[1] ?? null,
+    order_date:     isoFromDayMonthYear(mOrderDate?.[1]),
+    receipt_date:   isoFromDayMonthYear(mReceiptDate?.[1]),
+    total_cents:    toCents(mTotal?.[1]),
+    pages: parsed.numpages,
+    text_excerpt: text.slice(0, 800),
+    line_items: items.length ? items : undefined,
   };
 }
