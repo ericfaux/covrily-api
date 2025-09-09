@@ -1,327 +1,247 @@
+// @ts-nocheck
 // api/admin/ui.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-;
 
+export const config = { runtime: "nodejs" } as const;
+
+// Simple html util
+const H = String.raw;
+
+// Pull ADMIN_TOKEN into page at runtime (we don’t expose it in html; we read it from URL)
+// UI expects you to open:  /api/admin/ui?token=YOUR_ADMIN_TOKEN
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const tokenQ = (req.query.token as string) || "";
-
   res.setHeader("content-type", "text/html; charset=utf-8");
-  return res.status(200).send(`<!doctype html>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Covrily Admin</title>
+  res.status(200).send(pageHtml());
+}
+
+function pageHtml() {
+  return H`
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Covrily – Admin UI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <style>
-:root{
-  --bg:#0b1220; --card:#0e1629; --text:#e6edf3; --muted:#99a3b3; --border:#1f2a44; --accent:#5b9dff; --success:#22c55e; --warn:#f59e0b; --danger:#ef4444;
-}
-:root.light{
-  --bg:#f8fafc; --card:#ffffff; --text:#0f172a; --muted:#64748b; --border:#e5e7eb; --accent:#2563eb; --success:#16a34a; --warn:#d97706; --danger:#dc2626;
-}
-*{box-sizing:border-box}
-html,body{margin:0;padding:0;height:100%}
-body{font-family:ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial; background:var(--bg); color:var(--text)}
-a{color:var(--accent);text-decoration:none}
-.wrap{max-width:1100px;margin:0 auto;padding:24px}
-.header{
-  display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;
-}
-.brand{
-  display:flex;align-items:center;gap:12px;
-}
-.logo{
-  width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#6ee7ff,#5b9dff 55%,#a78bfa); border:1px solid rgba(255,255,255,.15);
-  box-shadow:0 10px 18px rgba(0,0,0,.25) inset, 0 2px 6px rgba(0,0,0,.2);
-}
-.title{font-weight:700;font-size:20px}
-.badge{font-size:12px;padding:2px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted)}
-.theme{
-  display:flex;gap:8px;align-items:center
-}
-button, input{
-  font:inherit;
-}
-.btn{
-  padding:8px 12px;border:1px solid var(--border);background:var(--text);color:var(--bg);
-  border-radius:10px;cursor:pointer;transition:.15s transform ease;
-}
-.btn:active{transform:translateY(1px)}
-.btn.ghost{background:transparent;color:var(--text)}
-.btn.primary{background:var(--accent);color:#fff;border-color:transparent}
-.btn.success{background:var(--success);color:#fff;border-color:transparent}
-.btn.warn{background:var(--warn);color:#fff;border-color:transparent}
-.btn.danger{background:var(--danger);color:#fff;border-color:transparent}
-.btn.sm{padding:6px 10px;font-size:12px;border-radius:8px}
-
-.grid{
-  display:grid;gap:16px;grid-template-columns:1fr;
-}
-.card{
-  background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;
-}
-h2{margin:0 0 10px;font-size:16px}
-.row{display:grid;grid-template-columns:180px 1fr;gap:12px;align-items:center;margin:10px 0}
-input, select{
-  width:100%;padding:10px;border:1px solid var(--border);border-radius:10px;background:transparent;color:var(--text)
-}
-.help{color:var(--muted);font-size:12px;margin-top:6px}
-
-.kv{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px;color:var(--muted)}
-.toolbar{display:flex;gap:8px;flex-wrap:wrap}
-hr{border:none;border-top:1px solid var(--border);margin:12px 0}
-
-.output{
-  position:sticky;bottom:0;left:0;right:0;margin-top:16px;
-  background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px;
-}
-pre{margin:0;background:transparent;color:var(--text);max-height:340px;overflow:auto;}
-.controls{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-.small{font-size:12px;color:var(--muted)}
-.toast{
-  position:fixed; right:20px; bottom:20px; background:var(--card); border:1px solid var(--border);
-  color:var(--text); padding:10px 12px; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,.3);
-  opacity:0; transform:translateY(8px); transition:.2s; z-index:9999;
-}
-.toast.show{opacity:1; transform:translateY(0)}
-.spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.5);border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;margin-left:8px}
-@keyframes spin{to{transform:rotate(360deg)}}
+  :root { --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --brand:#22d3ee; }
+  *{box-sizing:border-box} html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:14px/1.4 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+  a{color:var(--brand)} .wrap{max-width:980px;margin:28px auto;padding:0 16px}
+  h1{font-size:22px;margin:0 0 16px} h2{font-size:16px;margin:0 0 12px}
+  .card{background:var(--panel);border-radius:14px;padding:16px;margin:16px 0;box-shadow:0 0 0 1px rgba(255,255,255,.03)}
+  .row{display:grid;grid-template-columns:180px 1fr;gap:12px;align-items:center;margin:10px 0}
+  .row > label{color:var(--muted)}
+  input,button,textarea{font:inherit}
+  input[type=text]{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #1f2937;background:#0b1220;color:var(--text)}
+  .btn{background:#111827;border:1px solid #1f2937;color:#e5e7eb;padding:8px 12px;border-radius:10px;cursor:pointer}
+  .btn:hover{border-color:#334155}
+  .btn.primary{background:#0ea5e9;border-color:#0284c7}
+  .stack{display:flex;gap:8px;flex-wrap:wrap}
+  .muted{color:var(--muted)}
+  .mono{font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+  .table{width:100%;border-collapse:collapse;margin-top:8px}
+  .table td{padding:6px 8px;border-top:1px solid #1f2937}
+  .right{text-align:right}
+  pre{white-space:pre-wrap;background:#0b1220;border-radius:12px;padding:12px;overflow:auto;border:1px solid #1f2937}
+  .pill{display:inline-block;border:1px solid #1f2937;border-radius:999px;padding:2px 8px;font-size:12px;color:var(--muted)}
 </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Covrily – Admin UI</h1>
 
-<div class="wrap">
-  <div class="header">
-    <div class="brand">
-      <div class="logo"></div>
-      <div>
-        <div class="title">Covrily – Admin</div>
-        <div class="badge">Internal tools</div>
-      </div>
-    </div>
-    <div class="theme">
-      <span class="small">Theme</span>
-      <button class="btn sm ghost" id="themeBtn">Toggle</button>
-    </div>
-  </div>
-
-  <div class="grid">
-
+    <!-- Auth -->
     <div class="card">
       <h2>Auth</h2>
-      <div class="row"><label>Admin Token</label><input id="token" placeholder="x-admin-token" /></div>
-      <div class="toolbar">
-        <button class="btn primary" onclick="saveToken()">Save token</button>
-        <button class="btn ghost" onclick="clearToken()">Clear</button>
-        <button class="btn ghost" onclick="ping()" id="pingBtn">Ping<span class="spin" id="pingSpin" style="display:none"></span></button>
+      <div class="row">
+        <label for="token">Admin Token</label>
+        <input id="token" type="text" placeholder="ADMIN_TOKEN"/>
       </div>
-      <div class="help">Token is stored in localStorage on this device only.</div>
+      <div class="stack">
+        <button class="btn" id="saveToken">Save token</button>
+        <button class="btn" id="clearToken">Clear</button>
+        <button class="btn" id="ping">Ping</button>
+        <span class="muted">Tip: token is stored in localStorage on this device only.</span>
+      </div>
     </div>
 
+    <!-- Receipt & Link -->
     <div class="card">
-      <h2>Recent Receipts</h2>
-      <div class="row"><label>Search (optional)</label><input id="q" placeholder="merchant or order #" /></div>
-      <div class="row"><label>Pick one</label>
-        <select id="receiptPick"><option value="">(load receipts)</option></select>
+      <h2>Receipt &amp; Link</h2>
+      <div class="row">
+        <label for="rid">Receipt ID</label>
+        <input id="rid" type="text" placeholder="UUID of receipts.id"/>
       </div>
-      <div class="toolbar">
-        <button class="btn" onclick="loadReceipts()" id="loadBtn">Load<span class="spin" id="loadSpin" style="display:none"></span></button>
-        <button class="btn ghost" onclick="copyRid()">Copy Receipt ID</button>
+      <div class="row">
+        <label for="purl">Product URL</label>
+        <input id="purl" type="text" placeholder="https://example.com/product/123"/>
       </div>
-      <div class="help">Loads the latest receipts (search filters by merchant/order id).</div>
+      <div class="row">
+        <label for="mhint">Merchant Hint</label>
+        <input id="mhint" type="text" placeholder="Best Buy (optional)"/>
+      </div>
+      <div class="stack">
+        <button class="btn" id="getLink">Get Link</button>
+        <button class="btn" id="upsertLink">Upsert Link</button>
+        <span class="muted">Uses /api/price/link</span>
+      </div>
     </div>
 
+    <!-- Receipt Snapshot (NEW) -->
     <div class="card">
-      <h2>Receipt & Link</h2>
-      <div class="row"><label>Receipt ID</label><input id="rid" placeholder="UUID of receipts.id" /></div>
-      <div class="row"><label>Product URL</label><input id="url" placeholder="https://example.com/product/123" /></div>
-      <div class="row"><label>Merchant Hint</label><input id="hint" placeholder="Best Buy (optional)" /></div>
-      <div class="toolbar">
-        <button class="btn" onclick="getLink()" id="getLinkBtn">Get Link<span class="spin" id="getLinkSpin" style="display:none"></span></button>
-        <button class="btn" onclick="upsertLink()" id="upsertBtn">Upsert Link<span class="spin" id="upsertSpin" style="display:none"></span></button>
+      <h2>Receipt Snapshot <span class="pill" id="rsCurrency"></span></h2>
+      <div class="stack" style="margin-bottom:8px">
+        <button class="btn" id="loadReceipt">Load Receipt</button>
+        <span class="muted">Shows currency, tax &amp; shipping from <code>/api/receipts</code>.</span>
       </div>
+      <table class="table mono" id="rsTable" style="display:none">
+        <tbody>
+          <tr><td>Merchant</td><td class="right" id="rsMerchant">—</td></tr>
+          <tr><td>Order ID</td><td class="right" id="rsOrder">—</td></tr>
+          <tr><td>Purchase Date</td><td class="right" id="rsDate">—</td></tr>
+          <tr><td>Subtotal (calc)</td><td class="right" id="rsSubtotal">—</td></tr>
+          <tr><td>Tax</td><td class="right" id="rsTax">—</td></tr>
+          <tr><td>Shipping</td><td class="right" id="rsShipping">—</td></tr>
+          <tr><td><strong>Total</strong></td><td class="right" id="rsTotal"><strong>—</strong></td></tr>
+        </tbody>
+      </table>
     </div>
 
+    <!-- Policy Preview -->
     <div class="card">
       <h2>Policy Preview</h2>
-      <div class="row"><label>Current Price ($)</label><input id="cur" placeholder="e.g. 10.00 (optional)" /></div>
-      <div class="toolbar">
-        <button class="btn" onclick="preview()" id="previewBtn">Preview<span class="spin" id="previewSpin" style="display:none"></span></button>
+      <div class="row">
+        <label for="currPrice">Current Price ($)</label>
+        <input id="currPrice" type="text" placeholder="e.g. 10.00 (optional)"/>
+      </div>
+      <div class="stack">
+        <button class="btn" id="preview">Preview</button>
+        <span class="muted">Uses /api/policy/preview</span>
       </div>
     </div>
 
+    <!-- Price Watch -->
     <div class="card">
       <h2>Price Watch</h2>
-      <div class="row"><label>Mock Price (cents)</label><input id="mock" placeholder="e.g. 1000 = $10.00" /></div>
-      <div class="toolbar">
-        <button class="btn" onclick="watchDry()" id="dryBtn">Dry Run<span class="spin" id="drySpin" style="display:none"></span></button>
-        <button class="btn success" onclick="watchSend()" id="sendBtn">Run & Send<span class="spin" id="sendSpin" style="display:none"></span></button>
+      <div class="row">
+        <label for="mockPrice">Mock Price (cents)</label>
+        <input id="mockPrice" type="text" placeholder="e.g. 1000 = $10.00"/>
+      </div>
+      <div class="stack">
+        <button class="btn" id="dryRun">Dry Run</button>
+        <button class="btn primary" id="runSend">Run &amp; Send</button>
+        <span class="muted">Uses /api/cron/price-watch</span>
       </div>
     </div>
 
+    <!-- Output -->
     <div class="card">
-      <h2>Decisions</h2>
-      <div class="toolbar">
-        <button class="btn" onclick="listDecisions()" id="listDecBtn">List</button>
-        <button class="btn ghost" onclick="createDecision('keep')">Create KEEP</button>
-        <button class="btn ghost" onclick="createDecision('return')">Create RETURN</button>
-        <button class="btn ghost" onclick="createDecision('price_adjust')">Create PRICE_ADJUST</button>
+      <h2>Output</h2>
+      <div class="stack" style="justify-content:flex-end">
+        <button class="btn" id="clear">Clear</button>
+        <button class="btn" id="copy">Copy</button>
       </div>
+      <pre id="out" class="mono" style="min-height:220px"></pre>
     </div>
-
-    <div class="output">
-      <div class="controls">
-        <div class="small">Output</div>
-        <div style="flex:1"></div>
-        <button class="btn sm ghost" onclick="clearOut()">Clear</button>
-        <button class="btn sm ghost" onclick="copyOut()">Copy</button>
-      </div>
-      <pre id="out">Ready.</pre>
-    </div>
-
   </div>
-</div>
-
-<div id="toast" class="toast"></div>
 
 <script>
-const $ = (id)=>document.getElementById(id);
-const ORIGIN = location.origin;
+(function(){
+  const $ = (id) => document.getElementById(id);
+  const fmtMoney = (cents, cur='USD') => {
+    if (cents == null || isNaN(cents)) return '—';
+    const v = Number(cents)/100;
+    try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: cur }).format(v); }
+    catch { return (cur + ' ' + v.toFixed(2)); }
+  };
+  const tokenFromQS = new URLSearchParams(location.search).get('token') || '';
+  const token = () => localStorage.getItem('covrily_admin_token') || tokenFromQS || $('token').value.trim();
 
-(function init(){
-  // theme
-  const t = localStorage.getItem("covrily_theme") || "dark";
-  if (t === "light") document.documentElement.classList.add("light");
-  $("themeBtn").addEventListener("click", () => {
-    const light = document.documentElement.classList.toggle("light");
-    localStorage.setItem("covrily_theme", light ? "light":"dark");
-  });
+  // wire inputs
+  $('token').value = localStorage.getItem('covrily_admin_token') || tokenFromQS || '';
 
-  // token priming
-  const url = new URL(location.href);
-  const tokenQ = url.searchParams.get("token") || "${tokenQ}";
-  if(tokenQ){ localStorage.setItem("covrily_admin_token", tokenQ); }
-  $("token").value = localStorage.getItem("covrily_admin_token") || tokenQ || "";
+  $('saveToken').onclick = () => {
+    const t = $('token').value.trim();
+    if (!t) return alert('Enter a token first.');
+    localStorage.setItem('covrily_admin_token', t);
+    alert('Saved.');
+  };
+  $('clearToken').onclick = () => { localStorage.removeItem('covrily_admin_token'); $('token').value=''; alert('Cleared.'); };
+  $('ping').onclick = async () => { print({ ok:true, ping:true, now: new Date().toISOString() }); };
 
-  // link picker on change
-  $("receiptPick").addEventListener("change", () => {
-    const v = $("receiptPick").value;
-    if(v){ $("rid").value = v; toast("Receipt selected"); }
-  });
+  const rid = () => $('rid').value.trim();
+  const base = () => location.origin;
 
-  // initial load
-  setTimeout(loadReceipts, 50);
+  function print(obj){ $('out').textContent = JSON.stringify(obj, null, 2); }
+  function append(obj){ const cur=$('out').textContent; $('out').textContent = (cur?cur+'\\n\\n':'') + JSON.stringify(obj, null, 2); }
+
+  // Get/Upsert Link
+  $('getLink').onclick = async () => {
+    const url = base()+\`/api/price/link?receipt_id=\${encodeURIComponent(rid())}&token=\${encodeURIComponent(token())}\`;
+    const r = await fetch(url); print(await r.json());
+  };
+  $('upsertLink').onclick = async () => {
+    const url = base()+\`/api/price/link?receipt_id=\${encodeURIComponent(rid())}&action=upsert&url=\${encodeURIComponent($('purl').value)}&merchant_hint=\${encodeURIComponent($('mhint').value)}&active=1&token=\${encodeURIComponent(token())}\`;
+    const r = await fetch(url); print(await r.json());
+  };
+
+  // NEW: Load Receipt Snapshot
+  $('loadReceipt').onclick = async () => {
+    const r = await fetch(base()+\`/api/receipts?id=\${encodeURIComponent(rid())}&token=\${encodeURIComponent(token())}\`);
+    const j = await r.json();
+    print(j);
+    if (!j.ok || !j.receipt){ $('rsTable').style.display='none'; return; }
+    const rc = j.receipt;
+    const cur = rc.currency || 'USD';
+    const tax = Number(rc.tax_cents ?? 0);
+    const ship = Number(rc.shipping_cents ?? 0);
+    const total = Number(rc.total_cents ?? 0);
+    const sub = Math.max(0, total - tax - ship);
+
+    $('rsCurrency').textContent = cur;
+    $('rsMerchant').textContent = rc.merchant || '—';
+    $('rsOrder').textContent = rc.order_id || '—';
+    $('rsDate').textContent = rc.purchase_date || '—';
+    $('rsSubtotal').textContent = fmtMoney(sub, cur);
+    $('rsTax').textContent = fmtMoney(tax, cur);
+    $('rsShipping').textContent = fmtMoney(ship, cur);
+    $('rsTotal').textContent = fmtMoney(total, cur);
+    $('rsTable').style.display = '';
+  };
+
+  // Policy Preview
+  $('preview').onclick = async () => {
+    const qp = new URLSearchParams({ id: rid(), token: token() });
+    const v = $('currPrice').value.trim();
+    if (v) qp.set('current_price', v);
+    const r = await fetch(base()+\`/api/policy/preview?\${qp}\`);
+    print(await r.json());
+  };
+
+  // Price watch
+  $('dryRun').onclick = async () => {
+    const qp = new URLSearchParams({ receipt_id: rid(), dry: '1' });
+    const mp = $('mockPrice').value.trim(); if (mp) qp.set('mock_price', mp);
+    const r = await fetch(base()+\`/api/cron/price-watch?\${qp}\`);
+    print(await r.json());
+  };
+  $('runSend').onclick = async () => {
+    const qp = new URLSearchParams({ receipt_id: rid() });
+    const mp = $('mockPrice').value.trim(); if (mp) qp.set('mock_price', mp);
+    const r = await fetch(base()+\`/api/cron/price-watch?\${qp}\`);
+    print(await r.json());
+  };
+
+  // Output utils
+  $('clear').onclick = () => { $('out').textContent = ''; };
+  $('copy').onclick = async () => {
+    await navigator.clipboard.writeText($('out').textContent || '');
+    alert('Copied to clipboard');
+  };
 })();
-
-function toast(msg){
-  const el = $("toast"); el.textContent = msg; el.classList.add("show");
-  setTimeout(()=>el.classList.remove("show"), 1600);
-}
-function log(obj){
-  try{
-    $("out").textContent = (typeof obj==='string') ? obj : JSON.stringify(obj, null, 2);
-    const pre = $("out"); pre.scrollTop = pre.scrollHeight;
-  }catch{ $("out").textContent = String(obj); }
-}
-function clearOut(){ $("out").textContent = "Cleared."; }
-async function copyOut(){ await navigator.clipboard.writeText($("out").textContent); toast("Output copied"); }
-
-function tok(){ return $("token").value || localStorage.getItem("covrily_admin_token") || ""; }
-function saveToken(){ localStorage.setItem("covrily_admin_token", $("token").value.trim()); toast("Token saved"); }
-function clearToken(){ localStorage.removeItem("covrily_admin_token"); $("token").value=""; toast("Token cleared"); }
-async function copyRid(){ if(!$("rid").value.trim()) return toast("No receipt id"); await navigator.clipboard.writeText($("rid").value.trim()); toast("Receipt ID copied"); }
-function rid(){ return $("rid").value.trim(); }
-
-async function api(path, opts={}){
-  const t = tok();
-  if(!t){ toast("Set token first"); throw new Error("no token"); }
-  const res = await fetch(ORIGIN + path, {
-    method: opts.method || "GET",
-    headers: Object.assign({ "x-admin-token": t, "accept":"application/json" }, opts.headers || {}),
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-    cache: "no-store", credentials: "same-origin",
-  });
-  const text = await res.text();
-  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-  if(!res.ok) return { ok:false, status:res.status, ...data };
-  return data;
-}
-
-async function withSpin(id, fn){
-  const btn = $(id); const spin = $(id.replace(/Btn$/,"Spin"));
-  if (spin) spin.style.display = "inline-block";
-  btn && (btn.disabled = true);
-  try { return await fn(); }
-  finally { if (spin) spin.style.display = "none"; btn && (btn.disabled = false); }
-}
-
-// --- actions ---
-async function ping(){ await withSpin("pingBtn", async ()=>{
-  const out = await api("/api/health"); log(out); toast(out.ok ? "OK" : "Error");
-}); }
-
-async function loadReceipts(){ await withSpin("loadBtn", async ()=>{
-  const q = $("q").value.trim();
-  const url = "/api/admin/receipts?limit=25" + (q?("&q="+encodeURIComponent(q)):"");
-  const out = await api(url);
-  log(out);
-  const sel = $("receiptPick"); sel.innerHTML = "<option value=''>("+ (out.ok? out.receipts.length : "0") +" loaded)</option>";
-  if(out.ok){
-    for(const r of out.receipts){
-      const d = r.purchase_date ? new Date(r.purchase_date).toISOString().slice(0,10) : "—";
-      const amt = typeof r.total_cents === "number" ? "$" + (r.total_cents/100).toFixed(2) : "";
-      const opt = document.createElement("option");
-      opt.value = r.id;
-      opt.textContent = \`\${d} • \${r.merchant ?? "unknown"} • \${amt} • \${r.order_id ?? ""}\`;
-      sel.appendChild(opt);
-    }
-  }
-  toast("Receipts loaded");
-}); }
-
-async function getLink(){ await withSpin("getLinkBtn", async ()=>{
-  if(!rid()) return toast("Missing receipt id");
-  const out = await api(\`/api/price/link?receipt_id=\${encodeURIComponent(rid())}\`);
-  log(out); toast(out.ok ? "Link fetched" : "Error");
-}); }
-
-async function upsertLink(){ await withSpin("upsertBtn", async ()=>{
-  if(!rid()) return toast("Missing receipt id");
-  const u = $("url").value.trim();
-  const h = $("hint").value.trim();
-  if(!u) return toast("Missing product URL");
-  const out = await api(\`/api/price/link?receipt_id=\${encodeURIComponent(rid())}&action=upsert&url=\${encodeURIComponent(u)}&merchant_hint=\${encodeURIComponent(h)}&active=1\`);
-  log(out); toast(out.ok ? "Link upserted" : "Error");
-}); }
-
-async function preview(){ await withSpin("previewBtn", async ()=>{
-  if(!rid()) return toast("Missing receipt id");
-  const cur = $("cur").value.trim();
-  const qs = cur ? \`&current_price=\${encodeURIComponent(cur)}\` : "";
-  const res = await fetch(ORIGIN + \`/api/policy/preview?id=\${encodeURIComponent(rid())}\${qs}\`, { cache:"no-store", credentials:"same-origin" });
-  const json = await res.json(); log(json);
-  toast(json.ok ? "Preview ready" : "Error");
-}); }
-
-async function watchDry(){ await withSpin("dryBtn", async ()=>{
-  if(!rid()) return toast("Missing receipt id");
-  const m = $("mock").value.trim(); if(!m) return toast("Enter mock price in cents");
-  const out = await api(\`/api/cron/price-watch?receipt_id=\${encodeURIComponent(rid())}&mock_price=\${encodeURIComponent(m)}&dry=1\`);
-  log(out); toast(out.ok ? "Dry run ok" : "Error");
-}); }
-
-async function watchSend(){ await withSpin("sendBtn", async ()=>{
-  if(!rid()) return toast("Missing receipt id");
-  const m = $("mock").value.trim(); if(!m) return toast("Enter mock price in cents");
-  const out = await api(\`/api/cron/price-watch?receipt_id=\${encodeURIComponent(rid())}&mock_price=\${encodeURIComponent(m)}\`);
-  log(out); toast(out.ok ? (out.emailed? "Email sent" : "No email") : "Error");
-}); }
-
-async function listDecisions(){
-  if(!rid()) return toast("Missing receipt id");
-  const out = await api(\`/api/decisions?receipt_id=\${encodeURIComponent(rid())}&action=list\`);
-  log(out); toast(out.ok ? "Listed" : "Error");
-}
-async function createDecision(kind){
-  if(!rid()) return toast("Missing receipt id");
-  const out = await api(\`/api/decisions?receipt_id=\${encodeURIComponent(rid())}&action=create&decision=\${encodeURIComponent(kind)}\`);
-  log(out); toast(out.ok ? "Created" : "Error");
-}
 </script>
-`);
+
+</body>
+</html>`;
 }
