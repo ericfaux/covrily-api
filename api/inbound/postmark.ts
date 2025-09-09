@@ -11,11 +11,11 @@ import parseHmPdf from "../../lib/pdf.js";
 export const config = { runtime: "nodejs" };
 
 // ---- env ----
-const SUPABASE_URL   = process.env.SUPABASE_URL!;
-const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const INBOUND_TOKEN  = process.env.POSTMARK_INBOUND_HOOK_TOKEN || ""; // optional while testing
-const RECEIPTS_BUCKET= process.env.RECEIPTS_BUCKET || "receipts";
-const DEFAULT_USER   = process.env.INBOUND_DEFAULT_USER_ID || "";
+const SUPABASE_URL     = process.env.SUPABASE_URL!;
+const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const INBOUND_TOKEN    = process.env.POSTMARK_INBOUND_HOOK_TOKEN || "";
+const RECEIPTS_BUCKET  = process.env.RECEIPTS_BUCKET || "receipts";
+const DEFAULT_USER     = process.env.INBOUND_DEFAULT_USER_ID || "";
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
 
 // ---- Postmark types ----
@@ -33,15 +33,29 @@ type PMInbound = {
 };
 
 // ---- helpers ----
+function safePayload(req: VercelRequest): any {
+  // Postmark sends application/json. Some runtimes pass body as string.
+  const b = (req as any).body;
+  if (!b) return {};
+  if (typeof b === "string") {
+    try { return JSON.parse(b); } catch { return {}; }
+  }
+  return b;
+}
+
 function verifySignature(req: VercelRequest): boolean | "skipped" {
   const sig = (req.headers["x-postmark-signature"] as string) || "";
   if (!INBOUND_TOKEN || !sig) return "skipped";
-  const raw = Buffer.from(JSON.stringify(req.body || {}), "utf8");
-  const hmac = crypto.createHmac("sha256", INBOUND_TOKEN).update(raw).digest("base64");
-  try { return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(sig)); } catch { return false; }
+  try {
+    const raw = Buffer.from(typeof req.body === "string" ? req.body : JSON.stringify(req.body || {}), "utf8");
+    const hmac = crypto.createHmac("sha256", INBOUND_TOKEN).update(raw).digest("base64");
+    return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(sig));
+  } catch {
+    return false;
+  }
 }
 
-function extractUserId(toFull: PMAddress[] | undefined): string | null {
+function resolveUserId(toFull: PMAddress[] | undefined): string | null {
   for (const r of toFull || []) {
     const email = (r.Email || "").toLowerCase();
     const m = email.match(/^[^+]+\+([0-9a-f-]{36})@/);
@@ -66,34 +80,57 @@ async function uploadPdf(supabase: ReturnType<typeof createClient>, userId: stri
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
-    return res.status(405).end();
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
+  // basic diagnostics always visible in Vercel logs
+  console.log("[inbound] hit", {
+    ct: req.headers["content-type"],
+    hasBody: !!req.body,
+  });
+
+  // signature check (allow bypass if configured)
   const sig = verifySignature(req);
-  if (sig !== true) {
-    if (!(sig === "skipped" && ALLOW_UNVERIFIED)) {
-      return res.status(401).json({ ok: false, error: "signature verification failed or missing" });
-    }
+  if (sig !== true && !ALLOW_UNVERIFIED) {
+    console.warn("[inbound] signature failed; blocking");
+    return res.status(401).json({ ok: false, error: "signature verification failed or missing" });
   }
 
-  const payload = req.body as PMInbound;
-  const userId = extractUserId(payload.ToFull);
-  if (!userId) return res.status(400).json({ ok: false, error: "user id not resolved" });
+  const payload: PMInbound = safePayload(req);
+  console.log("[inbound] keys", Object.keys(payload || {}));
 
-  const att = (payload.Attachments || []).find(a =>
+  const userId = resolveUserId(payload.ToFull);
+  if (!userId) {
+    console.warn("[inbound] no user id resolved");
+    return res.status(200).json({ ok: true, ignored: true, reason: "no-user-id" });
+  }
+
+  const atts = (payload.Attachments || []) as PMAttachment[];
+  console.log("[inbound] attachments", atts.length, atts.map(a => ({ n: a.Name, ct: a.ContentType, len: a.ContentLength })));
+
+  const att = atts.find(a =>
     (a.ContentType || "").toLowerCase().includes("pdf") ||
     (a.Name || "").toLowerCase().endsWith(".pdf")
   );
-  if (!att?.Content) return res.status(200).json({ ok: true, ignored: true, reason: "no-pdf-attachment" });
+  if (!att?.Content) {
+    console.log("[inbound] no pdf attachment");
+    return res.status(200).json({ ok: true, ignored: true, reason: "no-pdf-attachment" });
+  }
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
 
   try {
     const pdfBuf = Buffer.from(att.Content, "base64");
+
     const fromDomain = ((payload.From || "").split("@")[1] || "").toLowerCase();
     const merchant = fromDomain.includes("hm.") ? "hm.com" : fromDomain || "unknown";
 
     const preview = await parseHmPdf(pdfBuf);
+    console.log("[inbound] parsed preview", {
+      merchant: preview.merchant,
+      total: preview.total_cents,
+      order: preview.order_number,
+    });
 
     const { data: ins, error } = await supabase
       .from("receipts")
@@ -110,8 +147,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (error || !ins?.id) throw new Error(error?.message || "insert failed");
 
     let storage_path: string | null = null;
-    try { storage_path = await uploadPdf(supabase, userId, ins.id, att.Name || "receipt.pdf", pdfBuf); } catch {}
+    try { storage_path = await uploadPdf(supabase, userId, ins.id, att.Name || "receipt.pdf", pdfBuf); } catch (e: any) {
+      console.warn("[inbound] storage upload warn", e?.message || e);
+    }
 
+    console.log("[inbound] done", { receipt_id: ins.id, stored: !!storage_path });
     return res.status(200).json({
       ok: true,
       user_id: userId,
@@ -122,6 +162,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       preview
     });
   } catch (e: any) {
+    console.error("[inbound] error", e?.stack || e?.message || e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
