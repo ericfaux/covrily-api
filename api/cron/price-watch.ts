@@ -1,9 +1,9 @@
 // api/cron/price-watch.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
-import { extractPriceCentsFromHtml } from "../../lib/price-parsers";
-import { previewDecision } from "../../lib/decision-engine";
-import { sendMail } from "../../lib/mail";
+import { extractPriceCentsFromHtml } from "../../lib/price-parsers.js";
+import { previewDecision } from "../../lib/decision-engine.js";
+import { sendMail } from "../../lib/mail.js";
 
 const url = process.env.SUPABASE_URL!;
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
