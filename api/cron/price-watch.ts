@@ -1,4 +1,5 @@
 // api/cron/price-watch.ts
+export const config = { runtime: "nodejs" };
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import { extractPriceCentsFromHtml } from "../../lib/price-parsers.js";
