@@ -1,5 +1,6 @@
 // api/cron/purge-inbound.ts
 // Deletes inbound_emails older than 30 days. Safe 200 regardless (so cron doesn't thrash).
+export const config = { runtime: "nodejs" };
 
 import { createClient } from "@supabase/supabase-js";
 
