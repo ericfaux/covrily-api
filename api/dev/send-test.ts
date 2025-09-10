@@ -1,5 +1,5 @@
 // api/dev/send-test.ts
-import { sendEmail } from "../../lib/postmark";
+import { sendEmail } from "../../lib/postmark.js";
 
 export default async function handler(req: any, res: any) {
   const to = (req.query?.to as string) || process.env.EMAIL_FROM;

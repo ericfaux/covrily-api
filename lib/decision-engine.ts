@@ -1,5 +1,5 @@
 // lib/decision-engine.ts
-import { getPolicy, type MerchantPolicy } from "./policies";
+import { getPolicy, type MerchantPolicy } from "./policies.js";
 
 export type ReceiptLite = {
   merchant: string | null;

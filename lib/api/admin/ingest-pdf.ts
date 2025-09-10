@@ -1,7 +1,7 @@
 // api/admin/ingest-pdf.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
-import { parseHmPdf } from "../../lib/pdf";
+import parseHmPdf from "../../pdf.js";
 
 export const config = { runtime: "nodejs18.x" }; // pdf-parse needs Node
 

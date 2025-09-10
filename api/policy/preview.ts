@@ -1,7 +1,7 @@
 // api/policy/preview.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
-import { previewDecision } from "../../lib/decision-engine";
+import { previewDecision } from "../../lib/decision-engine.js";
 
 const url = process.env.SUPABASE_URL!;
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
