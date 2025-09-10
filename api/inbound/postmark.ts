@@ -6,7 +6,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 
 // IMPORTANT: default import; we’ll only call it with a real Buffer
-import parseHmPdf from "../../lib/pdf";
+import parseHmPdf from "../../lib/pdf.js";
 
 export const config = { runtime: "nodejs" }; // <- correct for Vercel Node runtimes
 
