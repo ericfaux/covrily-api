@@ -1,8 +1,10 @@
 Postmark
- -User Name : Covrily
+ -User Name: Covrily
+ -Inbound Email Address: 2bab2994ebb7aba47a2bbf1028fc422d@inbound.postmarkapp.com
+ -Inbound Webhook: https://covrily-api.vercel.app/api/inbound/postmark
    -Using Test site for now
 SupaBase
-  -Table Names
+  -Table Names 
     -deadlines
     -decisions
     -inbound_emails
