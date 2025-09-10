@@ -4,20 +4,19 @@ import pdfParse from "pdf-parse";
 /** dollars string -> cents (integer) */
 function toCents(v: string | number | null | undefined): number | null {
   if (v == null) return null;
-  const n = typeof v === "number" ? v : parseFloat(String(v).replace(/[, ]/g, ""));
-  return Number.isFinite(n) ? Math.round(n * 100) : null;
+  const n =
+    typeof v === "number" ? v : parseFloat(String(v).replace(/[, ]/g, ""));
+  if (!isFinite(n)) return null;
+  return Math.round(n * 100);
 }
 
 /** "25 July 2022" -> ISO date string (or null) */
 function isoFromDayMonthYear(s: string | null): string | null {
   if (!s) return null;
   const d = new Date(s);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-if (!input || (input as any).length === 0) {
-  throw new Error("empty pdf buffer");
-}
 export type PdfIngestPreview = {
   ok: boolean;
   merchant: string | null;
@@ -40,32 +39,40 @@ export type PdfIngestPreview = {
 export default async function parseHmPdf(
   input: Buffer | Uint8Array | ArrayBuffer
 ): Promise<PdfIngestPreview> {
-  // Normalize to Node Buffer so pdf-parse never interprets it as a path
-  const buf = Buffer.isBuffer(input) ? input : Buffer.from(input as any);
+  // --- normalize to a Node Buffer so pdf-parse never interprets it as a path ---
+  let buf: Buffer;
+  if (!input) throw new Error("empty pdf buffer");
+  if (Buffer.isBuffer(input)) buf = input;
+  else if (input instanceof Uint8Array) buf = Buffer.from(input);
+  else if (input instanceof ArrayBuffer) buf = Buffer.from(new Uint8Array(input));
+  else throw new Error("parseHmPdf requires Buffer/typed array input");
 
   const parsed = await pdfParse(buf);
-  const raw = (parsed.text || "").replace(/\r/g, "").replace(/[ \t]+/g, " ").trim();
+  const text = (parsed.text || "")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .trim();
 
-  // Heuristics for a few fields
-  const mOrder       = raw.match(/ORDER NUMBER\s+([A-Z0-9\-]+)/i);
-  const mReceipt     = raw.match(/RECEIPT NUMBER\s+([A-Z0-9\-]+)/i);
-  const mReceiptDate = raw.match(/RECEIPT DATE\s+(\d{1,2} [A-Za-z]+ \d{4})/i);
-  const mOrderDate   = raw.match(/ORDER DATE\s+(\d{1,2} [A-Za-z]+ \d{4})/i);
-  const mTotal       = raw.match(/TOTAL[: ]+\$?\s*([0-9]+(?:\.[0-9]{2})?)/i);
-  const mTax         = raw.match(/(SALES\s+TAX|TAX)[: ]+\$?\s*([0-9]+(?:\.[0-9]{2})?)/i);
-  const mShip        = raw.match(/(SHIPPING(?: & HANDLING)?)[: ]+\$?\s*([0-9]+(?:\.[0-9]{2})?)/i);
+  // Heuristics for H&M‑style fields
+  const mOrder     = text.match(/ORDER NUMBER\s+([A-Z0-9\-]+)/i);
+  const mReceipt   = text.match(/RECEIPT NUMBER\s+([A-Z0-9\-]+)/i);
+  const mOrderDate = text.match(/ORDER DATE\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})/i);
+  const mRcptDate  = text.match(/RECEIPT DATE\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})/i);
+  const mTotal     = text.match(/TOTAL[: ]+\$?\s*([0-9]+(?:\.[0-9]{2})?)/i);
+  const mTax       = text.match(/SALES TAX[: ]+\$?\s*([0-9]+(?:\.[0-9]{2})?)/i);
+  const mShip      = text.match(/SHIPPING(?: & HANDLING)?[: ]+\$?\s*([0-9]+(?:\.[0-9]{2})?)/i);
 
   return {
     ok: true,
     merchant: "hm.com",
-    order_number:   mOrder?.[1] ?? null,
+    order_number: mOrder?.[1] ?? null,
     receipt_number: mReceipt?.[1] ?? null,
-    order_date:     isoFromDayMonthYear(mOrderDate?.[1] ?? null),
-    receipt_date:   isoFromDayMonthYear(mReceiptDate?.[1] ?? null),
-    total_cents:    toCents(mTotal?.[1] ?? null),
-    tax_cents:      toCents(mTax?.[2] ?? null),
-    shipping_cents: toCents(mShip?.[2] ?? null),
-    pages: parsed.numpages,
-    text_excerpt: raw.slice(0, 800)
+    order_date: isoFromDayMonthYear(mOrderDate?.[1] ?? null),
+    receipt_date: isoFromDayMonthYear(mRcptDate?.[1] ?? null),
+    total_cents: toCents(mTotal?.[1] ?? null),
+    tax_cents: toCents(mTax?.[1] ?? null),
+    shipping_cents: toCents(mShip?.[1] ?? null),
+    pages: typeof parsed.numpages === "number" ? parsed.numpages : undefined,
+    text_excerpt: text.slice(0, 800)
   };
 }
