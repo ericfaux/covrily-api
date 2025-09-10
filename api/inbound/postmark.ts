@@ -27,7 +27,14 @@ const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
 
 // Safe JSON body reader (Postmark posts JSON)
 async function readJson(req: VercelRequest): Promise<any> {
-  if (req.body && typeof req.body === "object") return req.body;
+  const body = req.body as any;
+  if (body) {
+    if (typeof body === "string") {
+      try { return JSON.parse(body); } catch { return {}; }
+    }
+    if (typeof body === "object" && !Buffer.isBuffer(body)) return body;
+  }
+
   const raw = await new Promise<string>((resolve, reject) => {
     let s = "";
     req.on("data", c => (s += c));
