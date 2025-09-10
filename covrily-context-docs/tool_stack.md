@@ -4,20 +4,11 @@ Postmark
  -Inbound Webhook: https://covrily-api.vercel.app/api/inbound/postmark
    -Using Test site for now
 SupaBase
-  -Table Names 
-    -deadlines
-    -decisions
-    -inbound_emails
-    -line_items
-    -policies
-    -price_observations
-    -product_links
-    -products
-    -profiles
-    -push_tokens
-    -receipts
+  -Database (Table and Column Names) : Found in file covrily-context-docs/Supabase_db.sql
+  -Storage: Receipts
 
 Vercel
+  -Domain: https://covrily-api.vercel.app/
   -Environment Variables (with current values)
     -SUPABASE_SERVICE_ROLE_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFtYmxzcGV2aXZ2eWp5d25nendkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NzExNjMwNiwiZXhwIjoyMDcyNjkyMzA2fQ.tB4BLO-5esp9YVYSSTXDB_dAkmt0do3uhJVxzyUWqlE
     -SUPABASE_URL: https://amblspevivvyjywngzwd.supabase.co
@@ -35,6 +26,6 @@ Vercel
       -this matches the receipts storage bucket in supabase
     -INBOUND_DEFAULT_USER_ID: d6756d38-a8fb-4705-bd26-05d4022d9800
     -INBOUND_DEFAULT_USER_ID: true
-Github
-  -Admin UI (created through github code)
+   
+
  
