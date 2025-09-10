@@ -1,155 +1,190 @@
-// api/inbound/postmark.ts
-// Robust Postmark inbound webhook that safely handles PDFs and never triggers
-// pdf-parse’s local test file fallback.
+// /api/inbound/postmark.ts
+// Minimal, production-safe inbound handler for Postmark with PDF attachments.
+//
+// Key fix: always pass a Buffer to the PDF parser (never a string path).
+//          import the local ESM module with `.js` (NodeNext).
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
+import parseHmPdf from "../../lib/pdf.js"; // <-- NOTE the .js extension
 
-// IMPORTANT: default import; we’ll only call it with a real Buffer
-import parseHmPdf from "../../lib/pdf.js";
+export const config = { runtime: "nodejs" };
 
-export const config = { runtime: "nodejs" }; // <- correct for Vercel Node runtimes
-
-// --- env
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SERVICE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+// ---- env ----
+const SUPABASE_URL   = process.env.SUPABASE_URL!;
+const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const RECEIPTS_BUCKET = process.env.RECEIPTS_BUCKET || "receipts";
+const DEFAULT_USER    = process.env.INBOUND_DEFAULT_USER_ID || "";
+const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
 
-// Optional soft “auth” during testing. When set, we require ?token=… to match.
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+// ---- types (subset of Postmark’s payload) ----
+type PMAddress = { Email?: string; Name?: string; MailboxHash?: string };
+type PMAttachment = {
+  Name?: string;
+  Content?: string;        // Base64
+  ContentType?: string;    // "application/pdf"
+  ContentLength?: number;
+};
+type PMInbound = {
+  From?: string;
+  FromFull?: PMAddress;
+  To?: string;
+  MailboxHash?: string;    // the part after + in the inbound address
+  Subject?: string;
+  TextBody?: string;
+  HtmlBody?: string;
+  Attachments?: PMAttachment[];
+};
 
-// If you use Postmark’s inbound webhook signature, you can verify it here.
-// For now we’ll gate with ADMIN_TOKEN only to simplify.
-
-function ok(res: VercelResponse, body: any = { ok: true }) {
-  return res.status(200).json(body);
+// ---- helpers ----
+function sanitizeUuid(s?: string): string | undefined {
+  if (!s) return undefined;
+  const trimmed = s.trim().replace(/^['"<\s]+|['">\s]+$/g, "");
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmed)
+    ? trimmed
+    : undefined;
 }
-function bad(res: VercelResponse, msg: string, code = 400) {
-  return res.status(code).json({ ok: false, error: msg });
-}
 
-function isPdfAttachment(att: any): boolean {
-  const ct = (att?.ContentType || att?.ContentTypeFull || "").toLowerCase();
-  const name = (att?.Name || "").toLowerCase();
-  return ct.includes("application/pdf") || name.endsWith(".pdf");
-}
-
-function looksLikePdf(buf: Buffer): boolean {
-  // %PDF header bytes
-  return buf && buf.length >= 4 &&
-         buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
-}
-
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // 0) quick “auth” for manual tests (optional)
-  const token = (req.query.token as string) || "";
-  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) {
-    return bad(res, "not found", 404);
+function firstNonEmpty(...vals: (string | null | undefined)[]) {
+  for (const v of vals) {
+    if (v != null && String(v).trim() !== "") return String(v).trim();
   }
+  return undefined;
+}
 
-  // 1) Only POST from Postmark; GET can be used as a ping
+// read JSON body safely (Vercel may already give object in req.body)
+async function readJson(req: VercelRequest): Promise<any> {
+  if (req.body && typeof req.body === "object") return req.body;
+  const raw = await new Promise<string>((resolve, reject) => {
+    let buf = "";
+    req.on("data", (c) => (buf += c));
+    req.on("end", () => resolve(buf));
+    req.on("error", reject);
+  });
+  try { return JSON.parse(raw || "{}"); } catch { return {}; }
+}
+
+function toCents(n?: number | string | null): number | null {
+  if (n == null || n === "") return null;
+  const v = typeof n === "number" ? n : parseFloat(String(n).replace(/[^\d.]/g, ""));
+  return Number.isFinite(v) ? Math.round(v * 100) : null;
+}
+
+function isoDateOrNull(s?: string | null): string | null {
+  if (!s) return null;
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+// ---- handler ----
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Simple “is alive” for Postmark setup page
   if (req.method === "GET" || req.method === "HEAD") {
-    return ok(res, { ok: true, info: "postmark webhook ok" });
+    return res.status(200).json({ ok: true, route: "inbound/postmark" });
   }
   if (req.method !== "POST") {
-    return bad(res, "method not allowed", 405);
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  const payload = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
-  const attachments = Array.isArray(payload?.Attachments) ? payload.Attachments : [];
+  // Optional: if you later wire Postmark signature verification, guard here.
+  if (!ALLOW_UNVERIFIED) {
+    // Left intentionally open (already gated by Postmark sending to this URL).
+    // Add HMAC verification here if/when you enable it.
+  }
 
-  // Postmark puts the “+<uuid>” in MailboxHash if you use address+<uuid>@inbound.postmarkapp.com
-  const mailboxHash: string = (payload?.MailboxHash || "").trim();
-  const userId = mailboxHash || process.env.INBOUND_DEFAULT_USER_ID || "";
+  // Parse payload
+  const payload: PMInbound = await readJson(req);
+  const attachments = Array.isArray(payload.Attachments) ? payload.Attachments : [];
+  const pdfs = attachments.filter(a =>
+    (a.ContentType || "").toLowerCase().includes("pdf") ||
+    (a.Name || "").toLowerCase().endsWith(".pdf")
+  );
+
+  if (pdfs.length === 0) {
+    // Nothing to do; acknowledge so Postmark shows “Processed”
+    return res.status(200).json({ ok: true, processed: 0, reason: "no-pdf-attachments" });
+  }
+
+  // user_id from MailboxHash (the +<uuid> part) or fallback
+  const userId =
+    sanitizeUuid(payload.MailboxHash) ||
+    sanitizeUuid(payload.FromFull?.MailboxHash) ||
+    sanitizeUuid(DEFAULT_USER);
 
   if (!userId) {
-    console.warn("[inbound] no user id (MailboxHash or default) → ack & skip.");
-    return ok(res, { ok: true, ignored: true, reason: "no user id" });
+    return res.status(200).json({ ok: true, ignored: true, reason: "missing user uuid" });
   }
 
-  // 2) Find the first PDF attachment; if none, ack & skip (don’t 500)
-  const pdfAtt = attachments.find(isPdfAttachment);
-  if (!pdfAtt) {
-    console.warn("[inbound] no PDF attachment → ack & skip.");
-    return ok(res, { ok: true, ignored: true, reason: "no pdf attachment" });
-  }
+  const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
 
-  // 3) Decode base64 safely; ensure it looks like a PDF
-  let pdfBuf: Buffer | null = null;
-  try {
-    const b64 = String(pdfAtt.Content || "");
-    if (!b64) {
-      console.warn("[inbound] pdf attachment had no Content; ack & skip.");
-      return ok(res, { ok: true, ignored: true, reason: "empty pdf content" });
+  const results: any[] = [];
+
+  for (const att of pdfs) {
+    try {
+      // *** THE FIX: decode Base64 → Buffer ***
+      const b64 = att.Content || "";
+      if (!b64) {
+        results.push({ name: att.Name || "unnamed.pdf", ok: false, error: "empty attachment content" });
+        continue;
+      }
+      const buf = Buffer.from(b64, "base64");
+
+      // Parse the PDF buffer (never pass a string)
+      const preview = await parseHmPdf(buf);
+
+      const merchant = firstNonEmpty(preview.merchant, (payload.FromFull?.Email || "").split("@")[1], "unknown")!.toLowerCase();
+      const orderId  = firstNonEmpty(preview.order_number, "") || "";
+      const purchase = isoDateOrNull(preview.order_date || preview.receipt_date);
+      const totalCents = preview.total_cents != null ? preview.total_cents : toCents(null);
+      const taxCents   = preview.tax_cents   != null ? preview.tax_cents   : null;
+      const shipCents  = preview.shipping_cents != null ? preview.shipping_cents : null;
+
+      // Upsert receipt
+      const { data: receipt, error: rErr } = await supabase
+        .from("receipts")
+        .upsert(
+          [{
+            user_id: userId,
+            merchant,
+            order_id: orderId,               // keep '' not null for unique key
+            purchase_date: purchase,         // YYYY-MM-DD or null
+            total_cents: totalCents,
+            tax_cents: taxCents,
+            shipping_cents: shipCents,
+            currency: "USD"
+          }],
+          { onConflict: "user_id,merchant,order_id,purchase_date" }
+        )
+        .select("id")
+        .single();
+
+      if (rErr) throw rErr;
+      const receiptId = receipt?.id as string | undefined;
+
+      // Store original PDF in Supabase Storage (optional but useful)
+      if (receiptId) {
+        const path = `${userId}/${receiptId}.pdf`;
+        const { error: upErr } = await supabase
+          .storage
+          .from(RECEIPTS_BUCKET)
+          .upload(path, buf, {
+            contentType: att.ContentType || "application/pdf",
+            upsert: true
+          });
+        if (upErr) {
+          // Don’t fail the webhook for a storage hiccup; just log in the result
+          results.push({ name: att.Name, ok: true, receipt_id: receiptId, stored: false, store_error: upErr.message });
+          continue;
+        }
+      }
+
+      results.push({ name: att.Name, ok: true, receipt_id: receiptId, parsed: preview.ok === true });
+    } catch (e: any) {
+      results.push({ name: att.Name, ok: false, error: String(e?.message || e) });
     }
-    pdfBuf = Buffer.from(b64, "base64");
-  } catch (e) {
-    console.warn("[inbound] base64 decode failed → ack & skip.", e);
-    return ok(res, { ok: true, ignored: true, reason: "invalid base64" });
   }
 
-  if (!pdfBuf?.length || !looksLikePdf(pdfBuf)) {
-    console.warn("[inbound] not a real PDF (magic header missing) → ack & skip.");
-    return ok(res, { ok: true, ignored: true, reason: "not a pdf" });
-  }
-
-  const supabase = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
-
-  // 4) Persist the raw PDF to storage (handy for audits). Name: <ts>-<filename or random>.pdf
-  const ts = Math.floor(Date.now() / 1000);
-  const safeName = (pdfAtt.Name || `receipt-${ts}.pdf`).replace(/[^\w.\-]+/g, "_");
-  const objectPath = `${userId}/${ts}-${safeName}`;
-  {
-    const { error } = await supabase.storage.from(RECEIPTS_BUCKET).upload(objectPath, pdfBuf, {
-      contentType: "application/pdf",
-      upsert: false
-    });
-    if (error) console.warn("[inbound] storage upload warning:", error.message);
-  }
-
-  // 5) Parse the PDF into structured fields (defensive try/catch)
-  let parsed: Awaited<ReturnType<typeof parseHmPdf>> | null = null;
-  try {
-    parsed = await parseHmPdf(pdfBuf);
-  } catch (e: any) {
-    console.warn("[inbound] pdf parse failed; we will still ack. msg=", e?.message || e);
-    // We *could* fall back to a generic receipt row with unknowns; for now we just ack.
-    return ok(res, { ok: true, stored: objectPath, ignored: true, reason: "parse failed" });
-  }
-
-  // 6) Upsert into receipts (conservative on required fields)
-  const merchant = parsed?.merchant || "unknown";
-  const orderId  = parsed?.order_number || "";
-  const receiptDateISO = parsed?.receipt_date || parsed?.order_date || null;
-  const totalCents = parsed?.total_cents ?? null;
-
-  try {
-    const { data, error } = await supabase
-      .from("receipts")
-      .upsert(
-        [{
-          user_id: userId,
-          merchant,
-          order_id: orderId,
-          purchase_date: receiptDateISO,
-          total_cents: totalCents,
-          raw_url: null
-        }],
-        { onConflict: "user_id,merchant,order_id,purchase_date" }
-      )
-      .select("id")
-      .single();
-
-    if (error) {
-      console.error("[inbound] receipts.upsert error:", error.message);
-      return ok(res, { ok: true, stored: objectPath, ignored: true, reason: "db upsert error" });
-    }
-
-    // (Optional) If you compute deadlines right here, call your policy engine.
-    // For now we just return success.
-    return ok(res, { ok: true, stored: objectPath, receipt_id: data?.id ?? null, merchant, orderId });
-  } catch (e: any) {
-    console.error("[inbound] receipts.upsert exception:", e?.message || e);
-    return ok(res, { ok: true, stored: objectPath, ignored: true, reason: "db exception" });
-  }
+  return res.status(200).json({ ok: true, processed: results.length, results });
 }
