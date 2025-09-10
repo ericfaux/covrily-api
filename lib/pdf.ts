@@ -15,6 +15,9 @@ function isoFromDayMonthYear(s: string | null): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+if (!input || (input as any).length === 0) {
+  throw new Error("empty pdf buffer");
+}
 export type PdfIngestPreview = {
   ok: boolean;
   merchant: string | null;
