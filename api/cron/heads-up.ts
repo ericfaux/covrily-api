@@ -2,7 +2,7 @@
 // api/cron/heads-up.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
-import { sendMail } from "../../lib/mail";
+import { sendMail } from "../../lib/mail.js";
 
 const url = process.env.SUPABASE_URL!;
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
