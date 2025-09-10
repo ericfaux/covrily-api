@@ -4,10 +4,12 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "lib": ["ES2020", "DOM"],
-    "skipLibCheck": true,
     "strict": false,
+
     "esModuleInterop": true,
+    "skipLibCheck": true,
     "resolveJsonModule": true,
+
     "types": ["@types/node", "@vercel/node"]
   }
 }
