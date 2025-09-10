@@ -8,7 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 import parseHmPdf from "../../lib/pdf.js";
 
 // Use Node.js runtime (not edge)
-export const config = { runtime: "nodejs" as const };
+export const config = { runtime: "nodejs" };
 
 /* ------------------------------------------------------------------ */
 /*  Env                                                               */
