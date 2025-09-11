@@ -6,9 +6,6 @@ import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs/promises";
 import { load } from "cheerio";
 
-// IMPORTANT: ESM requires explicit extension for local imports
-import parsePdf from "../../lib/pdf.js";
-import type { ParsedReceipt } from "../../lib/parse.js";
 
 // Use Node.js runtime (not edge)
 export const config = { runtime: "nodejs" };
@@ -23,6 +20,7 @@ const RECEIPTS_BUCKET = process.env.RECEIPTS_BUCKET || "receipts";
 // optional helpers for defaults
 const DEFAULT_USER  = process.env.INBOUND_DEFAULT_USER_ID || "";
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
+const LLM_RECEIPT_ENABLED = process.env.LLM_RECEIPT_ENABLED === "true";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -175,8 +173,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const atts: PostmarkAttachment[] = Array.isArray(payload?.Attachments) ? payload.Attachments : [];
   const pdfs = atts.filter(a => (a?.ContentType || "").toLowerCase().includes("pdf"));
 
-  type ParsedPdf = ParsedReceipt;
-
   let parsed: ParsedPdf | null = null;
   let storedPath: string | null = null;
 
@@ -242,7 +238,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     shipping_cents: base.shipping_cents ?? textBase.shipping_cents
   };
 
-  const merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
+
+  if (
+    LLM_RECEIPT_ENABLED &&
+    (!order_id || merchant === "unknown" || total_cents == null)
+  ) {
+    const llmText = [subject, textBody, parsed?.text_excerpt].filter(Boolean).join("\n\n");
+    const llm = await extractReceipt(llmText);
+    if (llm) {
+      if (merchant === "unknown" && llm.merchant) merchant = llm.merchant.toLowerCase();
+      if (!order_id && llm.order_id) order_id = llm.order_id;
+      if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
+      if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
+    }
+  }
 
   // 4) Upsert the receipt
   try {
