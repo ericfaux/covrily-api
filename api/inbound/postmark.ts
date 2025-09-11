@@ -6,7 +6,8 @@ import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs/promises";
 
 // IMPORTANT: ESM requires explicit extension for local imports
-import parseHmPdf from "../../lib/pdf.js";
+import parsePdf from "../../lib/pdf.js";
+import type { ParsedReceipt } from "../../lib/parse.js";
 
 // Use Node.js runtime (not edge)
 export const config = { runtime: "nodejs" };
@@ -128,16 +129,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const atts: PostmarkAttachment[] = Array.isArray(payload?.Attachments) ? payload.Attachments : [];
   const pdfs = atts.filter(a => (a?.ContentType || "").toLowerCase().includes("pdf"));
 
-  interface ParsedPdf {
-    merchant?: string;
-    order_number?: string;
-    receipt_number?: string;
-    order_date?: string;
-    receipt_date?: string;
-    total_cents?: number;
-    tax_cents?: number;
-    shipping_cents?: number;
-  }
+  type ParsedPdf = ParsedReceipt;
 
   let parsed: ParsedPdf | null = null;
   let storedPath: string | null = null;
@@ -162,8 +154,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       }
 
-      // parse the H&M PDF (or other text-extractable PDFs)
-      parsed = (await parseHmPdf(buf)) as ParsedPdf;
+      // parse the PDF using retailer-specific heuristics
+      parsed = await parsePdf(buf);
 
       // store the original PDF in supabase storage for reference
       const folder = `${user_id || "unknown"}`;
@@ -189,12 +181,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const base     = naiveParse(subject, textBody);
 
   const merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
-  const order_id      = parsed?.order_number || base.order_id || "";
-  const receipt_num   = parsed?.receipt_number || "";
-  const purchase_date = parsed?.order_date || parsed?.receipt_date || null; // ISO or null
+  const order_id      = parsed?.order_id || base.order_id || "";
+  const purchase_date = parsed?.purchase_date || null; // ISO or null
   const total_cents   = (parsed?.total_cents ?? base.total_cents) ?? null;
-  const tax_cents     = parsed?.tax_cents ?? null;
-  const shipping_cents= parsed?.shipping_cents ?? null;
+  const tax_cents     = null;
+  const shipping_cents= null;
 
   // 4) Upsert the receipt
   try {
