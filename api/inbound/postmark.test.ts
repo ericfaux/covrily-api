@@ -38,9 +38,9 @@ supabaseStub.loaded = true;
 require.cache[supabasePath] = supabaseStub as any;
 
 const { default: handler } = await import('./postmark.js');
-const { default: parseHmPdf } = await import('../../lib/pdf.js');
+const { default: parsePdf } = await import('../../lib/pdf.js');
 
-test('passes decoded PDF buffer to parseHmPdf', async () => {
+test('passes decoded PDF buffer to parsePdf', async () => {
   pdfParseSpy.mock.resetCalls();
 
   const b64 = Buffer.from('fake pdf').toString('base64');
@@ -67,8 +67,8 @@ test('passes decoded PDF buffer to parseHmPdf', async () => {
   assert.deepStrictEqual(arg, Buffer.from(b64, 'base64'));
 });
 
-test('parseHmPdf throws on empty input', async () => {
-  await assert.rejects(() => parseHmPdf(undefined as any), /empty pdf buffer/);
+test('parsePdf throws on empty input', async () => {
+  await assert.rejects(() => parsePdf(undefined as any), /empty pdf buffer/);
 });
 
 test('reads attachment from file path when not base64', async () => {
