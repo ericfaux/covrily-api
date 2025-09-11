@@ -37,8 +37,8 @@ const fakeSupabase = {
 supabaseStub.exports = { createClient: () => fakeSupabase };
 supabaseStub.loaded = true;
 require.cache[supabasePath] = supabaseStub as any;
-
-
+const { default: handler } = await import('./postmark.js');
+const { default: parsePdf } = await import('../../lib/pdf.js');
 
 test('passes decoded PDF buffer to parsePdf', async () => {
   pdfParseSpy.mock.resetCalls();
@@ -102,7 +102,3 @@ test('reads attachment from file path when not base64', async () => {
   assert.ok(Buffer.isBuffer(arg));
   assert.deepStrictEqual(arg, Buffer.from('fake pdf'));
 });
-
-
-});
-
