@@ -4,7 +4,10 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs/promises";
-import { load } from "cheerio";
+import parsePdf from "../../lib/pdf.js";
+import type { ParsedReceipt } from "../../lib/parse.js";
+import extractReceipt from "../../lib/llm/extract-receipt.js";
+import { logParseResult } from "../../lib/parse-log.js";
 
 
 
@@ -76,21 +79,43 @@ function extractUuidFromTo(to?: string): string | undefined {
   const m = email?.match(/\+([0-9a-fA-F-]{36})@/);
   return m?.[1];
 }
+/* ------------------------------------------------------------------ */
+/*  Basic parsers                                                      */
+/* ------------------------------------------------------------------ */
 
+type ParsedPdf = ParsedReceipt & {
+  tax_cents?: number | null;
+  shipping_cents?: number | null;
+  text_excerpt?: string;
+};
 
-  // try very conservative extraction; the PDF is our main path
-  const combined = `${subject}\n${text}`;
-  const all = combined.toLowerCase();
+function naiveParse(subject: string, text: string): ParsedPdf {
+  const combined = `${subject}\n${text}`.toLowerCase();
   const merchant =
-    /best ?buy/.test(all) ? "bestbuy.com" :
-    /target/.test(all)   ? "target.com"   :
-    /walmart/.test(all)  ? "walmart.com"  :
-    /amazon/.test(all)   ? "amazon.com"   :
-    /hm\.?com|h&m/.test(all) ? "hm.com"   :
+    /best ?buy/.test(combined) ? "bestbuy.com" :
+    /target/.test(combined)   ? "target.com"   :
+    /walmart/.test(combined)  ? "walmart.com"  :
+    /amazon/.test(combined)   ? "amazon.com"   :
+    /hm\.?com|h&m/.test(combined) ? "hm.com"   :
     "unknown";
 
+  return {
+    merchant,
+    order_id: "",
+    purchase_date: null,
+    total_cents: null,
+    tax_cents: null,
+    shipping_cents: null
+  };
+}
 
-  return parsed;
+function stripHtml(html: string): string {
+  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function parseHtml(html: string): ParsedPdf {
+  const text = stripHtml(html);
+  return naiveParse("", text);
 }
 
 /* ------------------------------------------------------------------ */
@@ -180,6 +205,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   let base = htmlBody ? parseHtml(htmlBody) : {
     merchant: "unknown",
     order_id: "",
+    purchase_date: null,
     total_cents: null,
     tax_cents: null,
     shipping_cents: null
@@ -188,10 +214,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   base = {
     merchant: base.merchant !== "unknown" ? base.merchant : textBase.merchant,
     order_id: base.order_id || textBase.order_id,
+    purchase_date: base.purchase_date || textBase.purchase_date,
     total_cents: base.total_cents ?? textBase.total_cents,
     tax_cents: base.tax_cents ?? textBase.tax_cents,
     shipping_cents: base.shipping_cents ?? textBase.shipping_cents
   };
+
+  let {
+    merchant,
+    order_id,
+    purchase_date,
+    total_cents,
+    tax_cents,
+    shipping_cents
+  } = parsed
+    ? {
+        merchant: parsed.merchant,
+        order_id: parsed.order_id || base.order_id,
+        purchase_date: parsed.purchase_date ?? base.purchase_date,
+        total_cents: parsed.total_cents ?? base.total_cents,
+        tax_cents: parsed.tax_cents ?? base.tax_cents,
+        shipping_cents: parsed.shipping_cents ?? base.shipping_cents
+      }
+    : base;
 
 
   if (
