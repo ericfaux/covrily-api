@@ -76,16 +76,7 @@ function extractUuidFromTo(to?: string): string | undefined {
   return m?.[1];
 }
 
-// Very light email text parse fallback (subject + text)
-interface BasicParse {
-  merchant: string;
-  order_id: string;
-  total_cents: number | null;
-  tax_cents: number | null;
-  shipping_cents: number | null;
-}
 
-function naiveParse(subject: string, text: string): BasicParse {
   // try very conservative extraction; the PDF is our main path
   const combined = `${subject}\n${text}`;
   const all = combined.toLowerCase();
@@ -97,43 +88,6 @@ function naiveParse(subject: string, text: string): BasicParse {
     /hm\.?com|h&m/.test(all) ? "hm.com"   :
     "unknown";
 
-  const mOrder    = combined.match(/order\s*#?\s*([A-Z0-9\-]+)/i);
-  const mTotal    = combined.match(/\$?\s*([0-9]+\.[0-9]{2})\s*(total|amount)/i);
-  const mTax      = combined.match(/\$?\s*([0-9]+\.[0-9]{2})\s*tax/i);
-  const mShipping = combined.match(/\$?\s*([0-9]+\.[0-9]{2})\s*(shipping|delivery)/i);
-
-  const toCents = (m: RegExpMatchArray | null) =>
-    m ? Math.round(parseFloat(m[1]) * 100) : null;
-
-  return {
-    merchant,
-    order_id: mOrder?.[1]?.toString().toLowerCase() ?? "",
-    total_cents: toCents(mTotal),
-    tax_cents: toCents(mTax),
-    shipping_cents: toCents(mShipping)
-  };
-}
-// attempt to pull merchant/order info from structured HTML before naive text parsing
-function parseHtml(html: string): BasicParse {
-  const $ = load(html);
-  const text = $("body").text();
-  const parsed = naiveParse("", text);
-
-  if (parsed.merchant === "unknown") {
-    const links = new Set<string>();
-    $("a[href]").each((_, el) => {
-      const href = $(el).attr("href") || "";
-      const m = href.match(/https?:\/\/([^\/]+)/i);
-      if (m) links.add(m[1].toLowerCase());
-    });
-    for (const host of links) {
-      if (host.includes("bestbuy")) { parsed.merchant = "bestbuy.com"; break; }
-      if (host.includes("target"))  { parsed.merchant = "target.com";  break; }
-      if (host.includes("walmart")) { parsed.merchant = "walmart.com"; break; }
-      if (host.includes("amazon"))  { parsed.merchant = "amazon.com";  break; }
-      if (host.includes("hm"))      { parsed.merchant = "hm.com";      break; }
-    }
-  }
 
   return parsed;
 }

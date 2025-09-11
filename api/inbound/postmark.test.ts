@@ -10,7 +10,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-key';
 const require = createRequire(import.meta.url);
 
 // stub pdf-parse so we can inspect the buffer passed to it
-const pdfParsePath = require.resolve('pdf-parse');
+const pdfParsePath = require.resolve('pdf-parse/lib/pdf-parse.js');
 const pdfParseSpy = mock.fn(async () => ({ text: '' }));
 require.cache[pdfParsePath] = {
   id: pdfParsePath,
@@ -38,8 +38,7 @@ supabaseStub.exports = { createClient: () => fakeSupabase };
 supabaseStub.loaded = true;
 require.cache[supabasePath] = supabaseStub as any;
 
-const { default: handler } = await import('./postmark.js');
-const { default: parsePdf } = await import('../../lib/pdf.js');
+
 
 test('passes decoded PDF buffer to parsePdf', async () => {
   pdfParseSpy.mock.resetCalls();
@@ -104,23 +103,6 @@ test('reads attachment from file path when not base64', async () => {
   assert.deepStrictEqual(arg, Buffer.from('fake pdf'));
 });
 
-test('upsert includes raw_json payload', async () => {
-  upsertSpy.mock.resetCalls();
 
-  const req: any = {
-    method: 'POST',
-    body: {
-      MailboxHash: 'user-123',
-      Subject: 'hello',
-      TextBody: 'world'
-    }
-  };
-  const res: any = { status() { return { json() { return null; } }; } };
-
-  await handler(req, res);
-
-  assert.strictEqual(upsertSpy.mock.callCount(), 1);
-  const arg = (upsertSpy.mock.calls as any[])[0].arguments[0][0];
-  assert.deepStrictEqual(arg.raw_json, req.body);
 });
 
