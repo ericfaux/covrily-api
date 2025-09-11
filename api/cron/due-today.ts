@@ -1,4 +1,3 @@
-// @ts-nocheck
 // api/cron/due-today.ts
 export const config = { runtime: "nodejs" };
 import type { VercelRequest, VercelResponse } from "@vercel/node";
@@ -19,17 +18,19 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     const in24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
     const todayGate = new Date(now.getTime() - 18 * 60 * 60 * 1000).toISOString();
 
+    type ReceiptRef = {
+      user_id: string | null;
+      merchant: string | null;
+      order_id: string | null;
+      purchase_date: string | null;
+      total_cents: number | null;
+    };
+
     type Row = {
       id: string;
       due_at: string;
       receipt_id: string | null;
-      receipts: {
-        user_id: string | null;
-        merchant: string | null;
-        order_id: string | null;
-        purchase_date: string | null;
-        total_cents: number | null;
-      } | null;
+      receipts: ReceiptRef | null;
     };
 
     // 1) Find due-today deadlines
@@ -47,25 +48,33 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     if (error) throw error;
 
     // 2) Resolve emails for the unique user_ids
-    const userIds = Array.from(new Set((data ?? [])
-      .map(r => (r as any).receipts?.user_id)
-      .filter((x): x is string => !!x)));
+    const rows: Row[] = (data ?? []) as unknown as Row[];
+    const userIds = Array.from(
+      new Set(rows.map(r => r.receipts?.user_id).filter((x): x is string => !!x))
+    );
 
     const emails = new Map<string, string | null>();
     if (userIds.length) {
+      type ProfileRow = { id: string; email: string | null };
       const { data: profs, error: e2 } = await supabase
         .from("profiles")
         .select("id, email")
         .in("id", userIds);
       if (e2) throw e2;
-      for (const p of (profs ?? [])) emails.set((p as any).id, (p as any).email);
+      for (const p of (profs ?? []) as ProfileRow[]) emails.set(p.id, p.email);
     }
 
     // 3) Send
     let sent = 0;
-    for (const d of (data ?? []) as Row[]) {
-      const r = d.receipts ?? ({} as Row["receipts"]);
-      const userId = r?.user_id ?? null;
+    for (const d of rows) {
+      const r: ReceiptRef = d.receipts ?? {
+        user_id: null,
+        merchant: null,
+        order_id: null,
+        purchase_date: null,
+        total_cents: null,
+      };
+      const userId = r.user_id;
       const email = userId ? emails.get(userId) ?? null : null;
 
       // if no profile email, optionally fall back to NOTIFY_TO
@@ -77,13 +86,16 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
       }
 
       const when = new Date(d.due_at);
-      const amount = typeof r?.total_cents === "number" ? `$${(r!.total_cents!/100).toFixed(2)}` : "";
+      const amount = typeof r.total_cents === "number" ? `$${(r.total_cents/100).toFixed(2)}` : "";
 
-      const subject = `Reminder: ${(r?.merchant ?? "your purchase")} return window ends ${when.toISOString().replace("T"," ").replace(".000Z","Z")}`;
+      const subject = `Reminder: ${(r.merchant ?? "your purchase")} return window ends ${when
+        .toISOString()
+        .replace("T"," ")
+        .replace(".000Z","Z")}`;
       const body =
 `Heads up!
 
-Your ${r?.merchant ?? "purchase"} from ${r?.purchase_date ?? "unknown"} ${amount ? `(${amount})` : ""}
+Your ${r.merchant ?? "purchase"} from ${r.purchase_date ?? "unknown"} ${amount ? `(${amount})` : ""}
 is approaching the return deadline.
 Deadline (UTC): ${when.toISOString().replace("T"," ").replace(".000Z","Z")}
 
@@ -100,7 +112,8 @@ Open Covrily to review and decide: return or keep.`;
     }
 
     return res.status(200).json({ ok: true, sent_today: sent, users_resolved: userIds.length });
-  } catch (e: any) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return res.status(500).json({ ok: false, error: message });
   }
 }

@@ -1,11 +1,12 @@
 // api/inbound/postmark.ts
-// @ts-nocheck  // keep the handler resilient while we iterate
+// keep the handler resilient while we iterate
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
+import fs from "node:fs/promises";
+import { load } from "cheerio";
 
-// IMPORTANT: ESM requires explicit extension for local imports
-import parseHmPdf from "../../lib/pdf.js";
+
 
 // Use Node.js runtime (not edge)
 export const config = { runtime: "nodejs" };
@@ -20,19 +21,37 @@ const RECEIPTS_BUCKET = process.env.RECEIPTS_BUCKET || "receipts";
 // optional helpers for defaults
 const DEFAULT_USER  = process.env.INBOUND_DEFAULT_USER_ID || "";
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
+const LLM_RECEIPT_ENABLED = process.env.LLM_RECEIPT_ENABLED === "true";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
 /* ------------------------------------------------------------------ */
 
+interface PostmarkAttachment {
+  ContentType?: string;
+  Content?: string;
+  Name?: string;
+}
+
+interface PostmarkPayload {
+  MailboxHash?: string;
+  To?: string;
+  Subject?: string;
+  TextBody?: string;
+  HtmlBody?: string;
+  From?: string;
+  FromFull?: { Email?: string };
+  Attachments?: PostmarkAttachment[];
+}
+
 // Safe JSON body reader (Postmark posts JSON)
-async function readJson(req: VercelRequest): Promise<any> {
-  const body = req.body as any;
+async function readJson(req: VercelRequest): Promise<PostmarkPayload> {
+  const body = req.body;
   if (body) {
     if (typeof body === "string") {
-      try { return JSON.parse(body); } catch { return {}; }
+      try { return JSON.parse(body) as PostmarkPayload; } catch { return {} as PostmarkPayload; }
     }
-    if (typeof body === "object" && !Buffer.isBuffer(body)) return body;
+    if (typeof body === "object" && !Buffer.isBuffer(body)) return body as PostmarkPayload;
   }
 
   const raw = await new Promise<string>((resolve, reject) => {
@@ -41,7 +60,7 @@ async function readJson(req: VercelRequest): Promise<any> {
     req.on("end", () => resolve(s));
     req.on("error", reject);
   });
-  try { return JSON.parse(raw || "{}"); } catch { return {}; }
+  try { return JSON.parse(raw || "{}") as PostmarkPayload; } catch { return {} as PostmarkPayload; }
 }
 
 // Pull first email address from a header-ish string
@@ -58,22 +77,20 @@ function extractUuidFromTo(to?: string): string | undefined {
   return m?.[1];
 }
 
-// Very light email text parse fallback (subject + text)
-function naiveParse(subject: string, text: string) {
+
   // try very conservative extraction; the PDF is our main path
-  const all = `${subject}\n${text}`.toLowerCase();
+  const combined = `${subject}\n${text}`;
+  const all = combined.toLowerCase();
   const merchant =
     /best ?buy/.test(all) ? "bestbuy.com" :
     /target/.test(all)   ? "target.com"   :
     /walmart/.test(all)  ? "walmart.com"  :
+    /amazon/.test(all)   ? "amazon.com"   :
     /hm\.?com|h&m/.test(all) ? "hm.com"   :
     "unknown";
 
-  const mOrder = all.match(/order\s*#?\s*([a-z0-9\-]+)/i);
-  const mTotal = all.match(/\$?\s*([0-9]+\.[0-9]{2})\s*(total|amount)/i);
-  const total_cents = mTotal ? Math.round(parseFloat(mTotal[1]) * 100) : null;
 
-  return { merchant, order_id: mOrder?.[1] ?? "", total_cents };
+  return parsed;
 }
 
 /* ------------------------------------------------------------------ */
@@ -108,21 +125,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   });
 
   // 2) Try to parse a PDF attachment first (that’s your H&M case)
-  const atts: Array<any> = Array.isArray(payload?.Attachments) ? payload.Attachments : [];
+  const atts: PostmarkAttachment[] = Array.isArray(payload?.Attachments) ? payload.Attachments : [];
   const pdfs = atts.filter(a => (a?.ContentType || "").toLowerCase().includes("pdf"));
 
-  let parsed: any | null = null;
+  let parsed: ParsedPdf | null = null;
   let storedPath: string | null = null;
 
   try {
     if (pdfs.length > 0) {
-      // Postmark gives base64 in Attachment.Content — we MUST decode to Buffer
+      // Postmark gives base64 in Attachment.Content, but some dev setups
+      // (e.g. local Postmark webhooks) may supply a file path instead.
       const a0 = pdfs[0];
-      const b64 = a0.Content || "";
-      const buf = Buffer.from(b64, "base64"); // <<< critical: feed Buffer to pdf-parse
+      const raw = a0.Content || "";
+      let buf: Buffer;
 
-      // parse the H&M PDF (or other text-extractable PDFs)
-      parsed = await parseHmPdf(buf);
+      if (/^[A-Za-z0-9+/=\r\n]+$/.test(raw)) {
+        // looks like base64
+        buf = Buffer.from(raw, "base64");
+      } else {
+        try {
+          // try reading as a file path
+          buf = await fs.readFile(raw);
+        } catch {
+          buf = Buffer.from(raw, "base64");
+        }
+      }
+
+      // parse the PDF using retailer-specific heuristics
+      parsed = await parsePdf(buf);
 
       // store the original PDF in supabase storage for reference
       const folder = `${user_id || "unknown"}`;
@@ -135,24 +165,57 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
       if (!up.error) storedPath = key;
     }
-  } catch (e: any) {
+  } catch (e) {
     // If PDF failed, fall back to naive from subject/body
-    console.warn("[inbound] pdf parse failed:", e?.message || e);
+    const message = e instanceof Error ? e.message : String(e);
+    console.warn("[inbound] pdf parse failed:", message);
   }
 
   // 3) Build the record from parsed (pdf) or fallback (subject+text)
-  const subject = payload?.Subject || "";
-  const textBody = payload?.TextBody || "";
-  const from     = payload?.FromFull?.Email || firstEmail(payload?.From) || "";
-  const base     = naiveParse(subject, textBody);
+  const subject   = payload?.Subject || "";
+  const textBody  = payload?.TextBody || "";
+  const htmlBody  = payload?.HtmlBody || "";
 
-  const merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
-  const order_id      = parsed?.order_number || base.order_id || "";
-  const receipt_num   = parsed?.receipt_number || "";
-  const purchase_date = parsed?.order_date || parsed?.receipt_date || null; // ISO or null
-  const total_cents   = (parsed?.total_cents ?? base.total_cents) ?? null;
-  const tax_cents     = parsed?.tax_cents ?? null;
-  const shipping_cents= parsed?.shipping_cents ?? null;
+  // Prefer HTML parsing when available, then fill gaps with text parsing
+  let base = htmlBody ? parseHtml(htmlBody) : {
+    merchant: "unknown",
+    order_id: "",
+    total_cents: null,
+    tax_cents: null,
+    shipping_cents: null
+  };
+  const textBase = naiveParse(subject, textBody);
+  base = {
+    merchant: base.merchant !== "unknown" ? base.merchant : textBase.merchant,
+    order_id: base.order_id || textBase.order_id,
+    total_cents: base.total_cents ?? textBase.total_cents,
+    tax_cents: base.tax_cents ?? textBase.tax_cents,
+    shipping_cents: base.shipping_cents ?? textBase.shipping_cents
+  };
+
+
+  if (
+    LLM_RECEIPT_ENABLED &&
+    (!order_id || merchant === "unknown" || total_cents == null)
+  ) {
+    const llmText = [subject, textBody, parsed?.text_excerpt].filter(Boolean).join("\n\n");
+    const llm = await extractReceipt(llmText);
+    if (llm) {
+      if (merchant === "unknown" && llm.merchant) merchant = llm.merchant.toLowerCase();
+      if (!order_id && llm.order_id) order_id = llm.order_id;
+      if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
+      if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
+    }
+  }
+
+  // Structured logging of parse outcome
+  await logParseResult({
+    parser: parsed ? "pdf" : "naive",
+    merchant,
+    order_id_found: !!order_id,
+    purchase_date_found: !!purchase_date,
+    total_cents_found: total_cents != null
+  });
 
   // 4) Upsert the receipt
   try {
@@ -168,7 +231,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           tax_cents,
           shipping_cents,
           currency: "USD",
-          raw_url: storedPath ? `supabase://${RECEIPTS_BUCKET}/${storedPath}` : null
+          raw_url: storedPath ? `supabase://${RECEIPTS_BUCKET}/${storedPath}` : null,
+          raw_json: payload
         }],
         { onConflict: "user_id,merchant,order_id,purchase_date" }
       )
@@ -185,8 +249,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         merchant, order_id, purchase_date, total_cents, tax_cents, shipping_cents
       } : null
     });
-  } catch (e: any) {
-    console.error("[inbound] upsert error:", e?.message || e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    console.error("[inbound] upsert error:", message);
+    return res.status(500).json({ ok: false, error: message });
   }
 }
