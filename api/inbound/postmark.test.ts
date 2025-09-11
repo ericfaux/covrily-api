@@ -10,7 +10,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-key';
 const require = createRequire(import.meta.url);
 
 // stub pdf-parse so we can inspect the buffer passed to it
-const pdfParsePath = require.resolve('pdf-parse');
+const pdfParsePath = require.resolve('pdf-parse/lib/pdf-parse.js');
 const pdfParseSpy = mock.fn(async () => ({ text: '' }));
 require.cache[pdfParsePath] = {
   id: pdfParsePath,
@@ -23,25 +23,26 @@ require.cache[pdfParsePath] = {
 const supabasePath = require.resolve('@supabase/supabase-js');
 const ModuleCtor = require('module');
 const supabaseStub = new ModuleCtor.Module(supabasePath);
+const upsertSpy = mock.fn(() => ({
+  select: () => ({
+    single: async () => ({ data: { id: 1 }, error: null })
+  })
+}));
+
 const fakeSupabase = {
   storage: { from: () => ({ upload: async () => ({ error: null }) }) },
-  from: () => ({
-    upsert: () => ({
-      select: () => ({
-        single: async () => ({ data: { id: 1 }, error: null })
-      })
-    })
-  })
+  from: () => ({ upsert: upsertSpy })
 };
+
 supabaseStub.exports = { createClient: () => fakeSupabase };
 supabaseStub.loaded = true;
 require.cache[supabasePath] = supabaseStub as any;
 
-const { default: handler } = await import('./postmark.js');
-const { default: parseHmPdf } = await import('../../lib/pdf.js');
 
-test('passes decoded PDF buffer to parseHmPdf', async () => {
+
+test('passes decoded PDF buffer to parsePdf', async () => {
   pdfParseSpy.mock.resetCalls();
+  upsertSpy.mock.resetCalls();
 
   const b64 = Buffer.from('fake pdf').toString('base64');
   const req: any = {
@@ -67,12 +68,13 @@ test('passes decoded PDF buffer to parseHmPdf', async () => {
   assert.deepStrictEqual(arg, Buffer.from(b64, 'base64'));
 });
 
-test('parseHmPdf throws on empty input', async () => {
-  await assert.rejects(() => parseHmPdf(undefined as any), /empty pdf buffer/);
+test('parsePdf throws on empty input', async () => {
+  await assert.rejects(() => parsePdf(undefined as any), /empty pdf buffer/);
 });
 
 test('reads attachment from file path when not base64', async () => {
   pdfParseSpy.mock.resetCalls();
+  upsertSpy.mock.resetCalls();
 
   const tmpDir = await fs.mkdtemp(`${os.tmpdir()}/`);
   const filePath = `${tmpDir}/test.pdf`;
@@ -99,5 +101,8 @@ test('reads attachment from file path when not base64', async () => {
   const arg = (pdfParseSpy.mock.calls as any[])[0].arguments[0];
   assert.ok(Buffer.isBuffer(arg));
   assert.deepStrictEqual(arg, Buffer.from('fake pdf'));
+});
+
+
 });
 
