@@ -4,6 +4,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs/promises";
+import { load } from "cheerio";
 
 // IMPORTANT: ESM requires explicit extension for local imports
 import parseHmPdf from "../../lib/pdf.js";
@@ -37,6 +38,7 @@ interface PostmarkPayload {
   To?: string;
   Subject?: string;
   TextBody?: string;
+  HtmlBody?: string;
   From?: string;
   FromFull?: { Email?: string };
   Attachments?: PostmarkAttachment[];
@@ -76,21 +78,65 @@ function extractUuidFromTo(to?: string): string | undefined {
 }
 
 // Very light email text parse fallback (subject + text)
-function naiveParse(subject: string, text: string): { merchant: string; order_id: string; total_cents: number | null } {
+interface BasicParse {
+  merchant: string;
+  order_id: string;
+  total_cents: number | null;
+  tax_cents: number | null;
+  shipping_cents: number | null;
+}
+
+function naiveParse(subject: string, text: string): BasicParse {
   // try very conservative extraction; the PDF is our main path
-  const all = `${subject}\n${text}`.toLowerCase();
+  const combined = `${subject}\n${text}`;
+  const all = combined.toLowerCase();
   const merchant =
     /best ?buy/.test(all) ? "bestbuy.com" :
     /target/.test(all)   ? "target.com"   :
     /walmart/.test(all)  ? "walmart.com"  :
+    /amazon/.test(all)   ? "amazon.com"   :
     /hm\.?com|h&m/.test(all) ? "hm.com"   :
     "unknown";
 
-  const mOrder = all.match(/order\s*#?\s*([a-z0-9\-]+)/i);
-  const mTotal = all.match(/\$?\s*([0-9]+\.[0-9]{2})\s*(total|amount)/i);
-  const total_cents = mTotal ? Math.round(parseFloat(mTotal[1]) * 100) : null;
+  const mOrder    = combined.match(/order\s*#?\s*([A-Z0-9\-]+)/i);
+  const mTotal    = combined.match(/\$?\s*([0-9]+\.[0-9]{2})\s*(total|amount)/i);
+  const mTax      = combined.match(/\$?\s*([0-9]+\.[0-9]{2})\s*tax/i);
+  const mShipping = combined.match(/\$?\s*([0-9]+\.[0-9]{2})\s*(shipping|delivery)/i);
 
-  return { merchant, order_id: mOrder?.[1] ?? "", total_cents };
+  const toCents = (m: RegExpMatchArray | null) =>
+    m ? Math.round(parseFloat(m[1]) * 100) : null;
+
+  return {
+    merchant,
+    order_id: mOrder?.[1]?.toString().toLowerCase() ?? "",
+    total_cents: toCents(mTotal),
+    tax_cents: toCents(mTax),
+    shipping_cents: toCents(mShipping)
+  };
+}
+// attempt to pull merchant/order info from structured HTML before naive text parsing
+function parseHtml(html: string): BasicParse {
+  const $ = load(html);
+  const text = $("body").text();
+  const parsed = naiveParse("", text);
+
+  if (parsed.merchant === "unknown") {
+    const links = new Set<string>();
+    $("a[href]").each((_, el) => {
+      const href = $(el).attr("href") || "";
+      const m = href.match(/https?:\/\/([^\/]+)/i);
+      if (m) links.add(m[1].toLowerCase());
+    });
+    for (const host of links) {
+      if (host.includes("bestbuy")) { parsed.merchant = "bestbuy.com"; break; }
+      if (host.includes("target"))  { parsed.merchant = "target.com";  break; }
+      if (host.includes("walmart")) { parsed.merchant = "walmart.com"; break; }
+      if (host.includes("amazon"))  { parsed.merchant = "amazon.com";  break; }
+      if (host.includes("hm"))      { parsed.merchant = "hm.com";      break; }
+    }
+  }
+
+  return parsed;
 }
 
 /* ------------------------------------------------------------------ */
@@ -183,18 +229,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // 3) Build the record from parsed (pdf) or fallback (subject+text)
-  const subject = payload?.Subject || "";
-  const textBody = payload?.TextBody || "";
-  const from     = payload?.FromFull?.Email || firstEmail(payload?.From) || "";
-  const base     = naiveParse(subject, textBody);
+  const subject   = payload?.Subject || "";
+  const textBody  = payload?.TextBody || "";
+  const htmlBody  = payload?.HtmlBody || "";
+
+  // Prefer HTML parsing when available, then fill gaps with text parsing
+  let base = htmlBody ? parseHtml(htmlBody) : {
+    merchant: "unknown",
+    order_id: "",
+    total_cents: null,
+    tax_cents: null,
+    shipping_cents: null
+  };
+  const textBase = naiveParse(subject, textBody);
+  base = {
+    merchant: base.merchant !== "unknown" ? base.merchant : textBase.merchant,
+    order_id: base.order_id || textBase.order_id,
+    total_cents: base.total_cents ?? textBase.total_cents,
+    tax_cents: base.tax_cents ?? textBase.tax_cents,
+    shipping_cents: base.shipping_cents ?? textBase.shipping_cents
+  };
 
   const merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
   const order_id      = parsed?.order_number || base.order_id || "";
   const receipt_num   = parsed?.receipt_number || "";
   const purchase_date = parsed?.order_date || parsed?.receipt_date || null; // ISO or null
-  const total_cents   = (parsed?.total_cents ?? base.total_cents) ?? null;
-  const tax_cents     = parsed?.tax_cents ?? null;
-  const shipping_cents= parsed?.shipping_cents ?? null;
+  const total_cents   = parsed?.total_cents ?? base.total_cents ?? null;
+  const tax_cents     = parsed?.tax_cents ?? base.tax_cents ?? null;
+  const shipping_cents= parsed?.shipping_cents ?? base.shipping_cents ?? null;
 
   // 4) Upsert the receipt
   try {
