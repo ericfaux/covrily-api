@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 
 // IMPORTANT: ESM requires explicit extension for local imports
 import parseHmPdf from "../../lib/pdf.js";
+import { logParseResult } from "../../lib/parse-log.js";
 
 // Use Node.js runtime (not edge)
 export const config = { runtime: "nodejs" };
@@ -195,6 +196,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const total_cents   = (parsed?.total_cents ?? base.total_cents) ?? null;
   const tax_cents     = parsed?.tax_cents ?? null;
   const shipping_cents= parsed?.shipping_cents ?? null;
+
+  // Structured logging of parse outcome
+  await logParseResult({
+    parser: parsed ? "pdf" : "naive",
+    merchant,
+    order_id_found: !!order_id,
+    purchase_date_found: !!purchase_date,
+    total_cents_found: total_cents != null
+  });
 
   // 4) Upsert the receipt
   try {
