@@ -3,6 +3,7 @@
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
+import fs from "node:fs/promises";
 
 // IMPORTANT: ESM requires explicit extension for local imports
 import parseHmPdf from "../../lib/pdf.js";
@@ -143,10 +144,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     if (pdfs.length > 0) {
-      // Postmark gives base64 in Attachment.Content — we MUST decode to Buffer
+      // Postmark gives base64 in Attachment.Content, but some dev setups
+      // (e.g. local Postmark webhooks) may supply a file path instead.
       const a0 = pdfs[0];
-      const b64 = a0.Content || "";
-      const buf = Buffer.from(b64, "base64"); // <<< critical: feed Buffer to pdf-parse
+      const raw = a0.Content || "";
+      let buf: Buffer;
+
+      if (/^[A-Za-z0-9+/=\r\n]+$/.test(raw)) {
+        // looks like base64
+        buf = Buffer.from(raw, "base64");
+      } else {
+        try {
+          // try reading as a file path
+          buf = await fs.readFile(raw);
+        } catch {
+          buf = Buffer.from(raw, "base64");
+        }
+      }
 
       // parse the H&M PDF (or other text-extractable PDFs)
       parsed = (await parseHmPdf(buf)) as ParsedPdf;
