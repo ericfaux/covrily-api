@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 import { load } from "cheerio";
 
 
+
 // Use Node.js runtime (not edge)
 export const config = { runtime: "nodejs" };
 
@@ -206,6 +207,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
     }
   }
+
+  // Structured logging of parse outcome
+  await logParseResult({
+    parser: parsed ? "pdf" : "naive",
+    merchant,
+    order_id_found: !!order_id,
+    purchase_date_found: !!purchase_date,
+    total_cents_found: total_cents != null
+  });
 
   // 4) Upsert the receipt
   try {
