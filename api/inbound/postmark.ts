@@ -210,7 +210,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           tax_cents,
           shipping_cents,
           currency: "USD",
-          raw_url: storedPath ? `supabase://${RECEIPTS_BUCKET}/${storedPath}` : null
+          raw_url: storedPath ? `supabase://${RECEIPTS_BUCKET}/${storedPath}` : null,
+          raw_json: payload
         }],
         { onConflict: "user_id,merchant,order_id,purchase_date" }
       )
