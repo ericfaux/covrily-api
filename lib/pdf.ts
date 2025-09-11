@@ -1,5 +1,5 @@
 // lib/pdf.ts
-import pdfParse from "pdf-parse";
+import pdfParse from "pdf-parse/lib/pdf-parse.js";
 
 /** dollars string -> cents (integer) */
 function toCents(v: string | number | null | undefined): number | null {
