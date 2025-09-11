@@ -1,44 +1,53 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert';
+import { createRequire } from 'node:module';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 
-// environment required by handler
 process.env.SUPABASE_URL = 'http://example.com';
 process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-key';
 
+const require = createRequire(import.meta.url);
+
+// create a minimal cheerio stub so the handler can import it
+await fs.mkdir(`${process.cwd()}/node_modules/cheerio`, { recursive: true });
+await fs.writeFile(
+  `${process.cwd()}/node_modules/cheerio/index.js`,
+  "exports.load = html => { const fn = sel => ({ text: () => html }); fn.text = () => html; return fn; };"
+);
+
+// stub pdf-parse so we can inspect the buffer passed to it
+const pdfParsePath = require.resolve('pdf-parse');
+const pdfParseSpy = mock.fn(async () => ({ text: '' }));
+require.cache[pdfParsePath] = {
+  id: pdfParsePath,
+  filename: pdfParsePath,
+  loaded: true,
+  exports: pdfParseSpy
+} as any;
+
+// stub supabase client
+const supabasePath = require.resolve('@supabase/supabase-js');
+const ModuleCtor = require('module');
+const supabaseStub = new ModuleCtor.Module(supabasePath);
+const upsertSpy = mock.fn(() => ({
+  select: () => ({
+    single: async () => ({ data: { id: 1 }, error: null })
+  })
+}));
+const fakeSupabase = {
+  storage: { from: () => ({ upload: async () => ({ error: null }) }) },
+  from: () => ({ upsert: upsertSpy })
+};
+supabaseStub.exports = { createClient: () => fakeSupabase };
+supabaseStub.loaded = true;
+require.cache[supabasePath] = supabaseStub as any;
+
+const { default: handler } = await import('./postmark.js');
+const { default: parseHmPdf } = await import('../../lib/pdf.js');
+
 test('passes decoded PDF buffer to parseHmPdf', async () => {
-  const { createRequire } = await import('node:module');
-  const require = createRequire(import.meta.url);
-
-  // stub pdf-parse before lib/pdf.js is imported
-  const pdfParsePath = require.resolve('pdf-parse');
-  const pdfParseSpy = mock.fn(async () => ({ text: '' }));
-  require.cache[pdfParsePath] = {
-    id: pdfParsePath,
-    filename: pdfParsePath,
-    loaded: true,
-    exports: pdfParseSpy
-  } as any;
-
-  const fakeSupabase = {
-    storage: { from: () => ({ upload: async () => ({ error: null }) }) },
-    from: () => ({
-      upsert: () => ({
-        select: () => ({
-          single: async () => ({ data: { id: 1 }, error: null })
-        })
-      })
-    })
-  };
-
-  const supabasePath = require.resolve('@supabase/supabase-js');
-  const ModuleCtor = require('module');
-  const supabaseStub = new ModuleCtor.Module(supabasePath);
-  supabaseStub.exports = { createClient: () => fakeSupabase };
-  supabaseStub.loaded = true;
-  require.cache[supabasePath] = supabaseStub as any;
-
-  await import('../../lib/pdf.js');
-  const { default: handler } = await import('./postmark.js');
+  pdfParseSpy.mock.resetCalls();
 
   const b64 = Buffer.from('fake pdf').toString('base64');
   const req: any = {
@@ -54,10 +63,7 @@ test('passes decoded PDF buffer to parseHmPdf', async () => {
       ]
     }
   };
-
-  const res: any = {
-    status() { return { json() { return null; } }; }
-  };
+  const res: any = { status() { return { json() { return null; } }; } };
 
   await handler(req, res);
 
@@ -65,14 +71,64 @@ test('passes decoded PDF buffer to parseHmPdf', async () => {
   const arg = (pdfParseSpy.mock.calls as any[])[0].arguments[0];
   assert.ok(Buffer.isBuffer(arg));
   assert.deepStrictEqual(arg, Buffer.from(b64, 'base64'));
-
-  mock.restoreAll();
-  delete require.cache[pdfParsePath];
-  delete require.cache[supabasePath];
 });
 
 test('parseHmPdf throws on empty input', async () => {
-  const { default: parseHmPdf } = await import('../../lib/pdf.js');
   await assert.rejects(() => parseHmPdf(undefined as any), /empty pdf buffer/);
+});
+
+test('reads attachment from file path when not base64', async () => {
+  pdfParseSpy.mock.resetCalls();
+
+  const tmpDir = await fs.mkdtemp(`${os.tmpdir()}/`);
+  const filePath = `${tmpDir}/test.pdf`;
+  await fs.writeFile(filePath, Buffer.from('fake pdf'));
+
+  const req: any = {
+    method: 'POST',
+    body: {
+      MailboxHash: 'user-123',
+      Attachments: [
+        {
+          ContentType: 'application/pdf',
+          Content: filePath,
+          Name: 'receipt.pdf'
+        }
+      ]
+    }
+  };
+  const res: any = { status() { return { json() { return null; } }; } };
+
+  await handler(req, res);
+
+  assert.strictEqual(pdfParseSpy.mock.callCount(), 1);
+  const arg = (pdfParseSpy.mock.calls as any[])[0].arguments[0];
+  assert.ok(Buffer.isBuffer(arg));
+  assert.deepStrictEqual(arg, Buffer.from('fake pdf'));
+});
+
+test('parses HtmlBody with cheerio when no attachment', async () => {
+  pdfParseSpy.mock.resetCalls();
+  upsertSpy.mock.resetCalls();
+
+  const html = '<html><body><div>Order #ABC123</div><div>$10.99 total</div></body></html>';
+  const req: any = {
+    method: 'POST',
+    body: {
+      MailboxHash: 'user-123',
+      Subject: 'Your Best Buy receipt',
+      HtmlBody: html
+    }
+  };
+  const res: any = { status() { return { json() { return null; } }; } };
+
+  await handler(req, res);
+
+  assert.strictEqual(pdfParseSpy.mock.callCount(), 0);
+  assert.strictEqual(upsertSpy.mock.callCount(), 1);
+  const inserted = (upsertSpy.mock.calls as any[])[0].arguments[0][0];
+  assert.strictEqual(inserted.merchant, 'bestbuy.com');
+  assert.strictEqual(inserted.order_id, 'abc123');
+  assert.strictEqual(inserted.total_cents, 1099);
 });
 

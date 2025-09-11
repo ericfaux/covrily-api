@@ -1,8 +1,11 @@
+/// <reference path="../../cheerio.d.ts" />
 // api/inbound/postmark.ts
 // keep the handler resilient while we iterate
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
+import fs from "node:fs/promises";
+import { load } from "cheerio";
 
 // IMPORTANT: ESM requires explicit extension for local imports
 import parseHmPdf from "../../lib/pdf.js";
@@ -36,6 +39,7 @@ interface PostmarkPayload {
   To?: string;
   Subject?: string;
   TextBody?: string;
+  HtmlBody?: string;
   From?: string;
   FromFull?: { Email?: string };
   Attachments?: PostmarkAttachment[];
@@ -143,10 +147,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     if (pdfs.length > 0) {
-      // Postmark gives base64 in Attachment.Content — we MUST decode to Buffer
+      // Postmark gives base64 in Attachment.Content, but some dev setups
+      // (e.g. local Postmark webhooks) may supply a file path instead.
       const a0 = pdfs[0];
-      const b64 = a0.Content || "";
-      const buf = Buffer.from(b64, "base64"); // <<< critical: feed Buffer to pdf-parse
+      const raw = a0.Content || "";
+      let buf: Buffer;
+
+      if (/^[A-Za-z0-9+/=\r\n]+$/.test(raw)) {
+        // looks like base64
+        buf = Buffer.from(raw, "base64");
+      } else {
+        try {
+          // try reading as a file path
+          buf = await fs.readFile(raw);
+        } catch {
+          buf = Buffer.from(raw, "base64");
+        }
+      }
 
       // parse the H&M PDF (or other text-extractable PDFs)
       parsed = (await parseHmPdf(buf)) as ParsedPdf;
@@ -169,10 +186,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // 3) Build the record from parsed (pdf) or fallback (subject+text)
-  const subject = payload?.Subject || "";
+  const subject  = payload?.Subject || "";
   const textBody = payload?.TextBody || "";
+  const htmlBody = payload?.HtmlBody || "";
   const from     = payload?.FromFull?.Email || firstEmail(payload?.From) || "";
-  const base     = naiveParse(subject, textBody);
+
+  const base = htmlBody
+    ? naiveParse(subject, load(htmlBody).text())
+    : naiveParse(subject, textBody);
 
   const merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
   const order_id      = parsed?.order_number || base.order_id || "";
