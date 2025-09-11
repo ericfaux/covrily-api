@@ -23,16 +23,17 @@ require.cache[pdfParsePath] = {
 const supabasePath = require.resolve('@supabase/supabase-js');
 const ModuleCtor = require('module');
 const supabaseStub = new ModuleCtor.Module(supabasePath);
+const upsertSpy = mock.fn(() => ({
+  select: () => ({
+    single: async () => ({ data: { id: 1 }, error: null })
+  })
+}));
+
 const fakeSupabase = {
   storage: { from: () => ({ upload: async () => ({ error: null }) }) },
-  from: () => ({
-    upsert: () => ({
-      select: () => ({
-        single: async () => ({ data: { id: 1 }, error: null })
-      })
-    })
-  })
+  from: () => ({ upsert: upsertSpy })
 };
+
 supabaseStub.exports = { createClient: () => fakeSupabase };
 supabaseStub.loaded = true;
 require.cache[supabasePath] = supabaseStub as any;
@@ -42,6 +43,7 @@ const { default: parsePdf } = await import('../../lib/pdf.js');
 
 test('passes decoded PDF buffer to parsePdf', async () => {
   pdfParseSpy.mock.resetCalls();
+  upsertSpy.mock.resetCalls();
 
   const b64 = Buffer.from('fake pdf').toString('base64');
   const req: any = {
@@ -73,6 +75,7 @@ test('parsePdf throws on empty input', async () => {
 
 test('reads attachment from file path when not base64', async () => {
   pdfParseSpy.mock.resetCalls();
+  upsertSpy.mock.resetCalls();
 
   const tmpDir = await fs.mkdtemp(`${os.tmpdir()}/`);
   const filePath = `${tmpDir}/test.pdf`;
@@ -99,5 +102,25 @@ test('reads attachment from file path when not base64', async () => {
   const arg = (pdfParseSpy.mock.calls as any[])[0].arguments[0];
   assert.ok(Buffer.isBuffer(arg));
   assert.deepStrictEqual(arg, Buffer.from('fake pdf'));
+});
+
+test('upsert includes raw_json payload', async () => {
+  upsertSpy.mock.resetCalls();
+
+  const req: any = {
+    method: 'POST',
+    body: {
+      MailboxHash: 'user-123',
+      Subject: 'hello',
+      TextBody: 'world'
+    }
+  };
+  const res: any = { status() { return { json() { return null; } }; } };
+
+  await handler(req, res);
+
+  assert.strictEqual(upsertSpy.mock.callCount(), 1);
+  const arg = (upsertSpy.mock.calls as any[])[0].arguments[0][0];
+  assert.deepStrictEqual(arg.raw_json, req.body);
 });
 
