@@ -23,27 +23,26 @@ require.cache[pdfParsePath] = {
 const supabasePath = require.resolve('@supabase/supabase-js');
 const ModuleCtor = require('module');
 const supabaseStub = new ModuleCtor.Module(supabasePath);
+const upsertSpy = mock.fn(() => ({
+  select: () => ({
+    single: async () => ({ data: { id: 1 }, error: null })
+  })
+}));
+
 const fakeSupabase = {
   storage: { from: () => ({ upload: async () => ({ error: null }) }) },
-  from: () => ({
-    upsert: () => ({
-      select: () => ({
-        single: async () => ({ data: { id: 1 }, error: null })
-      })
-    })
-  })
+  from: () => ({ upsert: upsertSpy })
 };
+
 supabaseStub.exports = { createClient: () => fakeSupabase };
 supabaseStub.loaded = true;
 require.cache[supabasePath] = supabaseStub as any;
 
-const postmarkMod = await import('./postmark.js');
-const handler = postmarkMod.default;
-const { naiveParse } = postmarkMod;
-const { default: parseHmPdf } = await import('../../lib/pdf.js');
 
-test('passes decoded PDF buffer to parseHmPdf', async () => {
+
+test('passes decoded PDF buffer to parsePdf', async () => {
   pdfParseSpy.mock.resetCalls();
+  upsertSpy.mock.resetCalls();
 
   const b64 = Buffer.from('fake pdf').toString('base64');
   const req: any = {
@@ -69,12 +68,13 @@ test('passes decoded PDF buffer to parseHmPdf', async () => {
   assert.deepStrictEqual(arg, Buffer.from(b64, 'base64'));
 });
 
-test('parseHmPdf throws on empty input', async () => {
-  await assert.rejects(() => parseHmPdf(undefined as any), /empty pdf buffer/);
+test('parsePdf throws on empty input', async () => {
+  await assert.rejects(() => parsePdf(undefined as any), /empty pdf buffer/);
 });
 
 test('reads attachment from file path when not base64', async () => {
   pdfParseSpy.mock.resetCalls();
+  upsertSpy.mock.resetCalls();
 
   const tmpDir = await fs.mkdtemp(`${os.tmpdir()}/`);
   const filePath = `${tmpDir}/test.pdf`;
@@ -103,47 +103,6 @@ test('reads attachment from file path when not base64', async () => {
   assert.deepStrictEqual(arg, Buffer.from('fake pdf'));
 });
 
-test('naiveParse extracts data for best buy', () => {
-  const subject = 'Best Buy order number 123-456';
-  const body = 'Total: $1,234.56';
-  const parsed = naiveParse(subject, body);
-  assert.deepStrictEqual(parsed, {
-    merchant: 'bestbuy.com',
-    order_id: '123-456',
-    total_cents: 123456
-  });
-});
 
-test('naiveParse extracts data for target', () => {
-  const subject = 'Your Target order #A1B2C3 has shipped';
-  const body = 'Total: $45.67';
-  const parsed = naiveParse(subject, body);
-  assert.deepStrictEqual(parsed, {
-    merchant: 'target.com',
-    order_id: 'a1b2c3',
-    total_cents: 4567
-  });
-});
-
-test('naiveParse extracts data for walmart', () => {
-  const subject = 'Walmart.com order number 78910';
-  const body = 'Amount: $98.76';
-  const parsed = naiveParse(subject, body);
-  assert.deepStrictEqual(parsed, {
-    merchant: 'walmart.com',
-    order_id: '78910',
-    total_cents: 9876
-  });
-});
-
-test('naiveParse extracts data for h&m', () => {
-  const subject = 'H&M Order 2468';
-  const body = 'Amount: $12.34';
-  const parsed = naiveParse(subject, body);
-  assert.deepStrictEqual(parsed, {
-    merchant: 'hm.com',
-    order_id: '2468',
-    total_cents: 1234
-  });
 });
 

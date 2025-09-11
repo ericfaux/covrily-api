@@ -4,9 +4,8 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs/promises";
+import { load } from "cheerio";
 
-// IMPORTANT: ESM requires explicit extension for local imports
-import parseHmPdf from "../../lib/pdf.js";
 
 // Use Node.js runtime (not edge)
 export const config = { runtime: "nodejs" };
@@ -21,6 +20,7 @@ const RECEIPTS_BUCKET = process.env.RECEIPTS_BUCKET || "receipts";
 // optional helpers for defaults
 const DEFAULT_USER  = process.env.INBOUND_DEFAULT_USER_ID || "";
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
+const LLM_RECEIPT_ENABLED = process.env.LLM_RECEIPT_ENABLED === "true";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -37,6 +37,7 @@ interface PostmarkPayload {
   To?: string;
   Subject?: string;
   TextBody?: string;
+  HtmlBody?: string;
   From?: string;
   FromFull?: { Email?: string };
   Attachments?: PostmarkAttachment[];
@@ -75,30 +76,20 @@ function extractUuidFromTo(to?: string): string | undefined {
   return m?.[1];
 }
 
-// Very light email text parse fallback (subject + text)
-export function naiveParse(subject: string, text: string): {
-  merchant: string;
-  order_id: string;
-  total_cents: number | null;
-} {
+
   // try very conservative extraction; the PDF is our main path
-  const all = `${subject}\n${text}`.toLowerCase();
+  const combined = `${subject}\n${text}`;
+  const all = combined.toLowerCase();
   const merchant =
     /best ?buy/.test(all) ? "bestbuy.com" :
     /target/.test(all)   ? "target.com"   :
     /walmart/.test(all)  ? "walmart.com"  :
+    /amazon/.test(all)   ? "amazon.com"   :
     /hm\.?com|h&m/.test(all) ? "hm.com"   :
     "unknown";
 
-  const mOrder = all.match(/order\s*(?:number\s*)?#?\s*([a-z0-9\-]+)/i);
-  const mTotal =
-    all.match(/(?:total|amount)[:\s]*\$?\s*([0-9,]+\.[0-9]{2})/i) ||
-    all.match(/\$?\s*([0-9,]+\.[0-9]{2})\s*(total|amount)/i);
-  const total_cents = mTotal
-    ? Math.round(parseFloat(mTotal[1].replace(/,/g, "")) * 100)
-    : null;
 
-  return { merchant, order_id: mOrder?.[1] ?? "", total_cents };
+  return parsed;
 }
 
 /* ------------------------------------------------------------------ */
@@ -136,17 +127,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const atts: PostmarkAttachment[] = Array.isArray(payload?.Attachments) ? payload.Attachments : [];
   const pdfs = atts.filter(a => (a?.ContentType || "").toLowerCase().includes("pdf"));
 
-  interface ParsedPdf {
-    merchant?: string;
-    order_number?: string;
-    receipt_number?: string;
-    order_date?: string;
-    receipt_date?: string;
-    total_cents?: number;
-    tax_cents?: number;
-    shipping_cents?: number;
-  }
-
   let parsed: ParsedPdf | null = null;
   let storedPath: string | null = null;
 
@@ -170,8 +150,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       }
 
-      // parse the H&M PDF (or other text-extractable PDFs)
-      parsed = (await parseHmPdf(buf)) as ParsedPdf;
+      // parse the PDF using retailer-specific heuristics
+      parsed = await parsePdf(buf);
 
       // store the original PDF in supabase storage for reference
       const folder = `${user_id || "unknown"}`;
@@ -191,18 +171,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // 3) Build the record from parsed (pdf) or fallback (subject+text)
-  const subject = payload?.Subject || "";
-  const textBody = payload?.TextBody || "";
-  const from     = payload?.FromFull?.Email || firstEmail(payload?.From) || "";
-  const base     = naiveParse(subject, textBody);
+  const subject   = payload?.Subject || "";
+  const textBody  = payload?.TextBody || "";
+  const htmlBody  = payload?.HtmlBody || "";
 
-  const merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
-  const order_id      = parsed?.order_number || base.order_id || "";
-  const receipt_num   = parsed?.receipt_number || "";
-  const purchase_date = parsed?.order_date || parsed?.receipt_date || null; // ISO or null
-  const total_cents   = (parsed?.total_cents ?? base.total_cents) ?? null;
-  const tax_cents     = parsed?.tax_cents ?? null;
-  const shipping_cents= parsed?.shipping_cents ?? null;
+  // Prefer HTML parsing when available, then fill gaps with text parsing
+  let base = htmlBody ? parseHtml(htmlBody) : {
+    merchant: "unknown",
+    order_id: "",
+    total_cents: null,
+    tax_cents: null,
+    shipping_cents: null
+  };
+  const textBase = naiveParse(subject, textBody);
+  base = {
+    merchant: base.merchant !== "unknown" ? base.merchant : textBase.merchant,
+    order_id: base.order_id || textBase.order_id,
+    total_cents: base.total_cents ?? textBase.total_cents,
+    tax_cents: base.tax_cents ?? textBase.tax_cents,
+    shipping_cents: base.shipping_cents ?? textBase.shipping_cents
+  };
+
+
+  if (
+    LLM_RECEIPT_ENABLED &&
+    (!order_id || merchant === "unknown" || total_cents == null)
+  ) {
+    const llmText = [subject, textBody, parsed?.text_excerpt].filter(Boolean).join("\n\n");
+    const llm = await extractReceipt(llmText);
+    if (llm) {
+      if (merchant === "unknown" && llm.merchant) merchant = llm.merchant.toLowerCase();
+      if (!order_id && llm.order_id) order_id = llm.order_id;
+      if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
+      if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
+    }
+  }
 
   // 4) Upsert the receipt
   try {
@@ -218,7 +221,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           tax_cents,
           shipping_cents,
           currency: "USD",
-          raw_url: storedPath ? `supabase://${RECEIPTS_BUCKET}/${storedPath}` : null
+          raw_url: storedPath ? `supabase://${RECEIPTS_BUCKET}/${storedPath}` : null,
+          raw_json: payload
         }],
         { onConflict: "user_id,merchant,order_id,purchase_date" }
       )
