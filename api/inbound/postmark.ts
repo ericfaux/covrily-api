@@ -232,16 +232,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const subject   = payload?.Subject || "";
   const textBody  = payload?.TextBody || "";
   const htmlBody  = payload?.HtmlBody || "";
-  const htmlBase  = htmlBody ? parseHtml(htmlBody) : null;
-  const base      = naiveParse(subject, textBody);
 
-  const merchant      = (parsed?.merchant || htmlBase?.merchant || base.merchant || "unknown").toLowerCase();
-  const order_id      = parsed?.order_number || htmlBase?.order_id || base.order_id || "";
+  // Prefer HTML parsing when available, then fill gaps with text parsing
+  let base = htmlBody ? parseHtml(htmlBody) : {
+    merchant: "unknown",
+    order_id: "",
+    total_cents: null,
+    tax_cents: null,
+    shipping_cents: null
+  };
+  const textBase = naiveParse(subject, textBody);
+  base = {
+    merchant: base.merchant !== "unknown" ? base.merchant : textBase.merchant,
+    order_id: base.order_id || textBase.order_id,
+    total_cents: base.total_cents ?? textBase.total_cents,
+    tax_cents: base.tax_cents ?? textBase.tax_cents,
+    shipping_cents: base.shipping_cents ?? textBase.shipping_cents
+  };
+
+  const merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
+  const order_id      = parsed?.order_number || base.order_id || "";
   const receipt_num   = parsed?.receipt_number || "";
   const purchase_date = parsed?.order_date || parsed?.receipt_date || null; // ISO or null
-  const total_cents   = (parsed?.total_cents ?? htmlBase?.total_cents ?? base.total_cents) ?? null;
-  const tax_cents     = parsed?.tax_cents ?? htmlBase?.tax_cents ?? base.tax_cents ?? null;
-  const shipping_cents= parsed?.shipping_cents ?? htmlBase?.shipping_cents ?? base.shipping_cents ?? null;
+  const total_cents   = parsed?.total_cents ?? base.total_cents ?? null;
+  const tax_cents     = parsed?.tax_cents ?? base.tax_cents ?? null;
+  const shipping_cents= parsed?.shipping_cents ?? base.shipping_cents ?? null;
 
   // 4) Upsert the receipt
   try {
