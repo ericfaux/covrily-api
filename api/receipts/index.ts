@@ -1,4 +1,3 @@
-// @ts-nocheck
 // api/receipts/index.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
@@ -23,14 +22,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 
+  type ReceiptRow = {
+    id: string;
+    user_id: string | null;
+    merchant: string | null;
+    order_id: string | null;
+    purchase_date: string | null;
+    total_cents: number | null;
+    tax_cents: number | null;
+    shipping_cents: number | null;
+    currency: string | null;
+    raw_url: string | null;
+  };
+
   const { data, error } = await supabase
     .from("receipts")
-    .select("id,user_id,merchant,order_id,purchase_date,total_cents,tax_cents,shipping_cents,currency,raw_url")
+    .select(
+      "id,user_id,merchant,order_id,purchase_date,total_cents,tax_cents,shipping_cents,currency,raw_url"
+    )
     .eq("id", id)
     .maybeSingle();
 
   if (error) return res.status(500).json({ ok: false, error: error.message });
-  if (!data) return res.status(404).json({ ok: false, error: "not found" });
+  const receipt = data as ReceiptRow | null;
+  if (!receipt) return res.status(404).json({ ok: false, error: "not found" });
 
-  return res.status(200).json({ ok: true, receipt: data });
+  return res.status(200).json({ ok: true, receipt });
 }
