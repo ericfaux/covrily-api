@@ -1,7 +1,8 @@
 // api/admin/ingest-pdf.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createClient } from "@supabase/supabase-js";
-import parseHmPdf from "../../pdf.js";
+import parsePdf from "../../pdf.js";
+import type { ParsedReceipt } from "../../parse.js";
 
 export const config = { runtime: "nodejs18.x" }; // pdf-parse needs Node
 
@@ -34,10 +35,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!r || !r.ok) return res.status(400).json({ ok: false, error: "failed to fetch pdf" });
     const buf = Buffer.from(await r.arrayBuffer());
 
-    // H&M-specific parse (simple and fast)
-    const preview = await parseHmPdf(buf);
+    // Parse the PDF with retailer-specific heuristics
+    const preview: ParsedReceipt = await parsePdf(buf);
 
-    if (!save) return res.status(200).json({ ok: true, source: "hm-pdf", preview });
+    if (!save) return res.status(200).json({ ok: true, source: "pdf", preview });
 
     // Save to DB
     const supabase = createClient(urlEnv, keyEnv, { auth: { persistSession: false, autoRefreshToken: false } });
@@ -50,13 +51,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       uid = prof.id;
     }
 
-    const purchase_date = preview.order_date || preview.receipt_date || new Date().toISOString();
+    const purchase_date = preview.purchase_date || new Date().toISOString();
     const { data: ins, error: e1 } = await supabase
       .from("receipts")
       .insert([{
         user_id: uid,
-        merchant: preview.merchant ?? "hm.com",
-        order_id: preview.order_number ?? preview.receipt_number ?? null,
+        merchant: preview.merchant ?? "unknown",
+        order_id: preview.order_id ?? null,
         total_cents: preview.total_cents ?? null,
         purchase_date: purchase_date
       }])
