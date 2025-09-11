@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 
 // IMPORTANT: ESM requires explicit extension for local imports
 import parseHmPdf from "../../lib/pdf.js";
+import extractReceipt from "../../lib/llm/extract-receipt.js";
 
 // Use Node.js runtime (not edge)
 export const config = { runtime: "nodejs" };
@@ -21,6 +22,7 @@ const RECEIPTS_BUCKET = process.env.RECEIPTS_BUCKET || "receipts";
 // optional helpers for defaults
 const DEFAULT_USER  = process.env.INBOUND_DEFAULT_USER_ID || "";
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
+const LLM_RECEIPT_ENABLED = process.env.LLM_RECEIPT_ENABLED === "true";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -137,6 +139,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     total_cents?: number;
     tax_cents?: number;
     shipping_cents?: number;
+    text_excerpt?: string;
   }
 
   let parsed: ParsedPdf | null = null;
@@ -188,13 +191,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const from     = payload?.FromFull?.Email || firstEmail(payload?.From) || "";
   const base     = naiveParse(subject, textBody);
 
-  const merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
-  const order_id      = parsed?.order_number || base.order_id || "";
-  const receipt_num   = parsed?.receipt_number || "";
-  const purchase_date = parsed?.order_date || parsed?.receipt_date || null; // ISO or null
-  const total_cents   = (parsed?.total_cents ?? base.total_cents) ?? null;
-  const tax_cents     = parsed?.tax_cents ?? null;
+  let merchant      = (parsed?.merchant || base.merchant || "unknown").toLowerCase();
+  let order_id      = parsed?.order_number || base.order_id || "";
+  const receipt_num = parsed?.receipt_number || "";
+  let purchase_date = parsed?.order_date || parsed?.receipt_date || null; // ISO or null
+  let total_cents   = (parsed?.total_cents ?? base.total_cents) ?? null;
+  const tax_cents   = parsed?.tax_cents ?? null;
   const shipping_cents= parsed?.shipping_cents ?? null;
+
+  if (
+    LLM_RECEIPT_ENABLED &&
+    (!order_id || merchant === "unknown" || total_cents == null)
+  ) {
+    const llmText = [subject, textBody, parsed?.text_excerpt].filter(Boolean).join("\n\n");
+    const llm = await extractReceipt(llmText);
+    if (llm) {
+      if (merchant === "unknown" && llm.merchant) merchant = llm.merchant.toLowerCase();
+      if (!order_id && llm.order_id) order_id = llm.order_id;
+      if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
+      if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
+    }
+  }
 
   // 4) Upsert the receipt
   try {
