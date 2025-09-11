@@ -76,7 +76,11 @@ function extractUuidFromTo(to?: string): string | undefined {
 }
 
 // Very light email text parse fallback (subject + text)
-function naiveParse(subject: string, text: string): { merchant: string; order_id: string; total_cents: number | null } {
+export function naiveParse(subject: string, text: string): {
+  merchant: string;
+  order_id: string;
+  total_cents: number | null;
+} {
   // try very conservative extraction; the PDF is our main path
   const all = `${subject}\n${text}`.toLowerCase();
   const merchant =
@@ -86,9 +90,13 @@ function naiveParse(subject: string, text: string): { merchant: string; order_id
     /hm\.?com|h&m/.test(all) ? "hm.com"   :
     "unknown";
 
-  const mOrder = all.match(/order\s*#?\s*([a-z0-9\-]+)/i);
-  const mTotal = all.match(/\$?\s*([0-9]+\.[0-9]{2})\s*(total|amount)/i);
-  const total_cents = mTotal ? Math.round(parseFloat(mTotal[1]) * 100) : null;
+  const mOrder = all.match(/order\s*(?:number\s*)?#?\s*([a-z0-9\-]+)/i);
+  const mTotal =
+    all.match(/(?:total|amount)[:\s]*\$?\s*([0-9,]+\.[0-9]{2})/i) ||
+    all.match(/\$?\s*([0-9,]+\.[0-9]{2})\s*(total|amount)/i);
+  const total_cents = mTotal
+    ? Math.round(parseFloat(mTotal[1].replace(/,/g, "")) * 100)
+    : null;
 
   return { merchant, order_id: mOrder?.[1] ?? "", total_cents };
 }

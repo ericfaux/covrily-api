@@ -10,7 +10,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-key';
 const require = createRequire(import.meta.url);
 
 // stub pdf-parse so we can inspect the buffer passed to it
-const pdfParsePath = require.resolve('pdf-parse');
+const pdfParsePath = require.resolve('pdf-parse/lib/pdf-parse.js');
 const pdfParseSpy = mock.fn(async () => ({ text: '' }));
 require.cache[pdfParsePath] = {
   id: pdfParsePath,
@@ -37,7 +37,9 @@ supabaseStub.exports = { createClient: () => fakeSupabase };
 supabaseStub.loaded = true;
 require.cache[supabasePath] = supabaseStub as any;
 
-const { default: handler } = await import('./postmark.js');
+const postmarkMod = await import('./postmark.js');
+const handler = postmarkMod.default;
+const { naiveParse } = postmarkMod;
 const { default: parseHmPdf } = await import('../../lib/pdf.js');
 
 test('passes decoded PDF buffer to parseHmPdf', async () => {
@@ -99,5 +101,49 @@ test('reads attachment from file path when not base64', async () => {
   const arg = (pdfParseSpy.mock.calls as any[])[0].arguments[0];
   assert.ok(Buffer.isBuffer(arg));
   assert.deepStrictEqual(arg, Buffer.from('fake pdf'));
+});
+
+test('naiveParse extracts data for best buy', () => {
+  const subject = 'Best Buy order number 123-456';
+  const body = 'Total: $1,234.56';
+  const parsed = naiveParse(subject, body);
+  assert.deepStrictEqual(parsed, {
+    merchant: 'bestbuy.com',
+    order_id: '123-456',
+    total_cents: 123456
+  });
+});
+
+test('naiveParse extracts data for target', () => {
+  const subject = 'Your Target order #A1B2C3 has shipped';
+  const body = 'Total: $45.67';
+  const parsed = naiveParse(subject, body);
+  assert.deepStrictEqual(parsed, {
+    merchant: 'target.com',
+    order_id: 'a1b2c3',
+    total_cents: 4567
+  });
+});
+
+test('naiveParse extracts data for walmart', () => {
+  const subject = 'Walmart.com order number 78910';
+  const body = 'Amount: $98.76';
+  const parsed = naiveParse(subject, body);
+  assert.deepStrictEqual(parsed, {
+    merchant: 'walmart.com',
+    order_id: '78910',
+    total_cents: 9876
+  });
+});
+
+test('naiveParse extracts data for h&m', () => {
+  const subject = 'H&M Order 2468';
+  const body = 'Amount: $12.34';
+  const parsed = naiveParse(subject, body);
+  assert.deepStrictEqual(parsed, {
+    merchant: 'hm.com',
+    order_id: '2468',
+    total_cents: 1234
+  });
 });
 
