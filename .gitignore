@@ -1,0 +1,11 @@
+node_modules/
+.vercel/
+.tmp-test/
+.env
+.env.*
+# macOS
+.DS_Store
+# compiled output
+/dist/
+/out/
+
