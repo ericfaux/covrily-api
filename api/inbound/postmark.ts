@@ -200,6 +200,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const subject   = payload?.Subject || "";
   const textBody  = payload?.TextBody || "";
   const htmlBody  = payload?.HtmlBody || "";
+  const htmlText  = htmlBody ? stripHtml(htmlBody) : "";
 
   // Prefer HTML parsing when available, then fill gaps with text parsing
   let base = htmlBody ? parseHtml(htmlBody) : {
@@ -241,15 +242,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (
     LLM_RECEIPT_ENABLED &&
-    (!order_id || merchant === "unknown" || total_cents == null)
+    (!order_id || merchant === "unknown" || total_cents == null ||
+      tax_cents == null || shipping_cents == null)
   ) {
-    const llmText = [subject, textBody, parsed?.text_excerpt].filter(Boolean).join("\n\n");
+    const bodyText = textBody || htmlText;
+    const llmText = [subject, bodyText, parsed?.text_excerpt]
+      .filter(Boolean)
+      .join("\n\n");
     const llm = await extractReceipt(llmText);
     if (llm) {
       if (merchant === "unknown" && llm.merchant) merchant = llm.merchant.toLowerCase();
       if (!order_id && llm.order_id) order_id = llm.order_id;
       if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
       if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
+      if (tax_cents == null && llm.tax_cents != null) tax_cents = llm.tax_cents;
+      if (shipping_cents == null && llm.shipping_cents != null) shipping_cents = llm.shipping_cents;
     }
   }
 
