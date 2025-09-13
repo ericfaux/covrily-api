@@ -15,7 +15,18 @@ export function naiveParse(text: string, fromEmail: string): ParsedReceipt {
   const dateMatch = text.match(
     /(?:Date|Ordered on|Purchase Date):?\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{4}-\d{2}-\d{2})/
   );
-  const totalMatch = text.match(/\$([\d,]+\.\d{2})/);
+  const totalLine = text
+    .split(/\r?\n/)
+    .find((line) => /\btotal\b/i.test(line) && /\$[\d,]+\.\d{2}/.test(line));
+
+  let totalMatch: RegExpMatchArray | undefined;
+
+  if (totalLine) {
+    totalMatch = totalLine.match(/\$([\d,]+\.\d{2})/);
+  } else {
+    const matches = Array.from(text.matchAll(/\$([\d,]+\.\d{2})/g));
+    totalMatch = matches[matches.length - 1];
+  }
 
   const toCents = (s?: string) =>
     s ? Math.round(parseFloat(s.replace(/,/g, "")) * 100) : null;
