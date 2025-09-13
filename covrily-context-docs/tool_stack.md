@@ -28,6 +28,12 @@ Vercel
     -INBOUND_DEFAULT_USER_ID: true
     -OPENAI_API_KEY: secret
     -LLM_RECEIPT_ENABLED: true
+    -GMAIL_CLIENT_SECRET: secret
+    -GMAIL_CLIENT_ID: 744908254669-u517m0dmckbr98rd1s5265pjoba7fvea.apps.googleusercontent.com
+    -GMAIL_REDIRECT_URI: https://covrily-api-afteryou.vercel.app/api/gmail/callback
+    -AMAZON_REDIRECT_URI: https://covrily-api-afteryou.vercel.app/api/amazon/callback
+    -AMAZON_CLIENT_SECRET: secret
+    -AMAZON_CLIENT_ID: amzn1.application-oa2-client.fede780f5a8b4fd4b45e731d81ebb35d
    
 
  
