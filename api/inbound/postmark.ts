@@ -25,6 +25,7 @@ const RECEIPTS_BUCKET = process.env.RECEIPTS_BUCKET || "receipts";
 const DEFAULT_USER  = process.env.INBOUND_DEFAULT_USER_ID || "";
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED_INBOUND === "true";
 const LLM_RECEIPT_ENABLED = process.env.LLM_RECEIPT_ENABLED === "true";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -240,23 +241,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     : base;
 
 
-  if (
-    LLM_RECEIPT_ENABLED &&
-    (!order_id || merchant === "unknown" || total_cents == null ||
-      tax_cents == null || shipping_cents == null)
-  ) {
-    const bodyText = textBody || htmlText;
-    const llmText = [subject, bodyText, parsed?.text_excerpt]
-      .filter(Boolean)
-      .join("\n\n");
-    const llm = await extractReceipt(llmText);
-    if (llm) {
-      if (merchant === "unknown" && llm.merchant) merchant = llm.merchant.toLowerCase();
-      if (!order_id && llm.order_id) order_id = llm.order_id;
-      if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
-      if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
-      if (tax_cents == null && llm.tax_cents != null) tax_cents = llm.tax_cents;
-      if (shipping_cents == null && llm.shipping_cents != null) shipping_cents = llm.shipping_cents;
+  const needsReceipt =
+    !order_id || merchant === "unknown" || total_cents == null ||
+    tax_cents == null || shipping_cents == null;
+
+  if (needsReceipt) {
+    if (LLM_RECEIPT_ENABLED && OPENAI_API_KEY) {
+      const bodyText = textBody || htmlText;
+      const llmText = [subject, bodyText, parsed?.text_excerpt]
+        .filter(Boolean)
+        .join("\n\n");
+      const llm = await extractReceipt(llmText);
+      if (llm) {
+        if (merchant === "unknown" && llm.merchant) merchant = llm.merchant.toLowerCase();
+        if (!order_id && llm.order_id) order_id = llm.order_id;
+        if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
+        if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
+        if (tax_cents == null && llm.tax_cents != null) tax_cents = llm.tax_cents;
+        if (shipping_cents == null && llm.shipping_cents != null) shipping_cents = llm.shipping_cents;
+      }
+    } else {
+      console.warn(
+        "[inbound] receipt fields unresolved and LLM disabled or missing OPENAI_API_KEY"
+      );
     }
   }
 
