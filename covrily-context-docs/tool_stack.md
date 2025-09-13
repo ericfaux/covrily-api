@@ -26,6 +26,8 @@ Vercel
       -this matches the receipts storage bucket in supabase
     -INBOUND_DEFAULT_USER_ID: d6756d38-a8fb-4705-bd26-05d4022d9800
     -INBOUND_DEFAULT_USER_ID: true
+    -OPENAI_API_KEY: secret
+    -LLM_RECEIPT_ENABLED: true
    
 
  
