@@ -1,6 +1,5 @@
 // lib/gmail-scan.ts
 import { google } from "googleapis";
-import { parse } from "tldts";
 import { supabaseAdmin } from "./supabase-admin.js";
 
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID || "";
@@ -47,13 +46,14 @@ export async function getAccessToken(
 function extractDomain(from: string): string | null {
   const match = from.match(/@([^>\s]+)/);
   if (!match) return null;
-  const parsed = parse(match[1].toLowerCase());
-  return parsed.domain || null;
+  const domain = match[1].toLowerCase();
+  // strip any surrounding punctuation and subdomains
+  return domain.replace(/^[^\w]+|[^\w]+$/g, "");
 }
 
 export async function scanGmailMerchants(
   userId: string,
-  limit = Number(process.env.GMAIL_SCAN_LIMIT || 250)
+  limit = Number(process.env.GMAIL_SCAN_LIMIT || 100)
 ): Promise<string[]> {
   const tokens = await getAccessToken(userId);
   if (!tokens) return [];
@@ -71,36 +71,50 @@ export async function scanGmailMerchants(
   const merchants = new Set<string>();
   let pageToken: string | undefined;
   let fetched = 0;
+  const start = Date.now();
+  const maxMs = Number(process.env.GMAIL_SCAN_TIMEOUT_MS || 8000);
+  const batchSize = 20;
 
-  while (fetched < limit) {
+  while (fetched < limit && Date.now() - start < maxMs) {
     const res = await gmail.users.messages.list({
       userId: "me",
       labelIds: ["INBOX"],
       q,
-      maxResults: Math.min(500, limit - fetched),
+      maxResults: Math.min(100, limit - fetched),
       pageToken,
     });
 
     const messages = res.data.messages || [];
     if (messages.length === 0) break;
 
-    for (const msg of messages) {
-      if (!msg.id) continue;
-      const meta = await gmail.users.messages.get({
-        userId: "me",
-        id: msg.id,
-        format: "metadata",
-        metadataHeaders: ["From", "Subject"],
-      });
-      const headers = meta.data.payload?.headers || [];
-      const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
-      const subject = headers
-        .find((h: any) => (h.name || "").toLowerCase() === "subject")
-        ?.value;
-      if (!from || !subject || !keywordRegex.test(subject)) continue;
-      const domain = extractDomain(from);
-      if (!domain || domain.includes("amazon.")) continue;
-      merchants.add(domain);
+    // fetch message metadata in small batches for speed
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize).filter(m => m.id);
+      const metas = await Promise.allSettled(
+        batch.map(m =>
+          gmail.users.messages.get({
+            userId: "me",
+            id: m.id!,
+            format: "metadata",
+            metadataHeaders: ["From", "Subject"],
+          })
+        )
+      );
+
+      for (const meta of metas) {
+        if (meta.status !== "fulfilled") continue;
+        const headers = meta.value.data.payload?.headers || [];
+        const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
+        const subject = headers
+          .find((h: any) => (h.name || "").toLowerCase() === "subject")
+          ?.value;
+        if (!from || !subject || !keywordRegex.test(subject)) continue;
+        const domain = extractDomain(from);
+        if (!domain || domain.includes("amazon.")) continue;
+        merchants.add(domain);
+      }
+
+      if (Date.now() - start >= maxMs) break;
     }
 
     fetched += messages.length;
