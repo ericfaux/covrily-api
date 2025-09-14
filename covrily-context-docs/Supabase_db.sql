@@ -150,3 +150,9 @@ CREATE TABLE public.auth_merchants (
   merchant text NOT NULL,
   CONSTRAINT auth_merchants_pkey PRIMARY KEY (user_id, merchant)
 );
+
+CREATE TABLE public.approved_merchants (
+  user_id uuid NOT NULL,
+  merchant text NOT NULL,
+  CONSTRAINT approved_merchants_pkey PRIMARY KEY (user_id, merchant)
+);

@@ -11,9 +11,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   let bodyContent = "";
-  if (status === "linked") {
-    bodyContent = "<p>Gmail account linked successfully.</p>";
-  } else if (status === "error") {
+  if (status === "error") {
     bodyContent = "<p>Failed to link Gmail. Please try again.</p>";
   } else {
     bodyContent = `<button onclick="location.href='/api/gmail/auth?user=${encodeURIComponent(user)}'">Link Gmail</button>`;

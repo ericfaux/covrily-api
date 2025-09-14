@@ -1,7 +1,8 @@
 // api/gmail/merchants.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { scanGmailMerchants } from "../../lib/gmail-scan.js";
-import { upsertAuthorizedMerchants } from "../../lib/merchants.js";
+import { saveApprovedMerchants } from "../../lib/merchants.js";
+import { supabaseAdmin } from "../../lib/supabase-admin.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -10,6 +11,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!user) return res.status(400).json({ ok: false, error: "missing user" });
 
       const merchants = await scanGmailMerchants(user);
+
+      // store scanned merchants in auth_merchants table for review
+      await supabaseAdmin.from("auth_merchants").delete().eq("user_id", user);
+      if (merchants.length > 0) {
+        const payload = merchants.map((m) => ({ user_id: user, merchant: m }));
+        await supabaseAdmin
+          .from("auth_merchants")
+          .upsert(payload, { onConflict: "user_id,merchant" });
+      }
+
       return res.status(200).json({ ok: true, merchants });
     }
 
@@ -20,7 +31,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(400).json({ ok: false, error: "missing user or merchants" });
       }
 
-      await upsertAuthorizedMerchants(user, merchants);
+      await saveApprovedMerchants(user, merchants);
       return res.status(200).json({ ok: true });
     }
 
