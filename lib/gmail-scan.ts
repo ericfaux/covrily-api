@@ -50,6 +50,28 @@ function extractDomain(from: string): string | null {
   return getDomain(match[1].toLowerCase()) || null;
 }
 
+function extractDisplayName(from: string): string | null {
+  const match = from.match(/^(.*)<[^>]+>/);
+  if (!match) return null;
+  const name = match[1].replace(/["']/g, "").trim();
+  return name || null;
+}
+
+function extractMerchantFromSubject(subject: string): string | null {
+  const m = subject.match(/\bfrom\s+([^:-]+)/i) || subject.match(/\bat\s+([^:-]+)/i);
+  return m ? m[1].trim() : null;
+}
+
+function normalizeMerchant(value: string): string {
+  return value.trim().replace(/^["']+|["']+$/g, "").toLowerCase();
+}
+
+const GENERIC_DOMAINS = ["shopify.com"];
+
+function isGenericDomain(domain: string): boolean {
+  return GENERIC_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`));
+}
+
 export async function scanGmailMerchants(userId: string): Promise<string[]> {
   const tokens = await getAccessToken(userId);
   if (!tokens) return [];
@@ -89,8 +111,9 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
     const BATCH_SIZE = 10; // limit concurrent Gmail requests
 
     for (
-      let i = 0;
-      i < ids.length && totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING;
+      let i = 0,
+      len = ids.length;
+      i < len && totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING;
       i += BATCH_SIZE
     ) {
       const batchIds = ids.slice(i, i + BATCH_SIZE);
@@ -118,8 +141,15 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
         if (!from || !subject || !keywordRegex.test(subject)) continue;
         qualifying++;
         const domain = extractDomain(from);
-        if (!domain || /amazon\./i.test(domain)) continue;
-        merchants.add(domain);
+        const display = extractDisplayName(from);
+        if (domain && /amazon\./i.test(domain)) continue;
+        let merchant = domain;
+        if (!merchant || isGenericDomain(merchant)) {
+          merchant = display || extractMerchantFromSubject(subject);
+        }
+        if (merchant) {
+          merchants.add(normalizeMerchant(merchant));
+        }
         if (totalScanned >= MAX_SCANNED || qualifying >= MAX_QUALIFYING) break;
       }
     }
