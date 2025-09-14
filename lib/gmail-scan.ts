@@ -80,25 +80,39 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
     const messages = res.data.messages || [];
     if (messages.length === 0) break;
 
-    for (const msg of messages) {
-      if (processed >= 100) break;
-      if (!msg.id) continue;
-      const meta = await gmail.users.messages.get({
-        userId: "me",
-        id: msg.id,
-        format: "metadata",
-        metadataHeaders: ["From", "Subject"],
-      });
-      const headers = meta.data.payload?.headers || [];
-      const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
-      const subject = headers
-        .find((h: any) => (h.name || "").toLowerCase() === "subject")
-        ?.value;
-      processed++;
-      if (!from || !subject || !keywordRegex.test(subject)) continue;
-      const domain = extractDomain(from);
-      if (!domain || /amazon\./i.test(domain)) continue;
-      merchants.add(domain);
+    // Collect all message IDs for this page
+    const ids = messages.map((m) => m.id).filter((id): id is string => !!id);
+    const BATCH_SIZE = 10; // limit concurrent Gmail requests
+
+    for (let i = 0; i < ids.length && processed < 100; i += BATCH_SIZE) {
+      const batchIds = ids.slice(i, i + BATCH_SIZE);
+      const metas = await Promise.all(
+        batchIds.map((id) =>
+          gmail.users.messages
+            .get({
+              userId: "me",
+              id,
+              format: "metadata",
+              metadataHeaders: ["From", "Subject"],
+            })
+            .catch(() => null)
+        )
+      );
+
+      for (const meta of metas) {
+        if (!meta) continue;
+        const headers = meta.data.payload?.headers || [];
+        const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
+        const subject = headers
+          .find((h: any) => (h.name || "").toLowerCase() === "subject")
+          ?.value;
+        processed++;
+        if (!from || !subject || !keywordRegex.test(subject)) continue;
+        const domain = extractDomain(from);
+        if (!domain || /amazon\./i.test(domain)) continue;
+        merchants.add(domain);
+        if (processed >= 100) break;
+      }
     }
 
     if (processed >= 100 || !res.data.nextPageToken) break;
