@@ -11,17 +11,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!user) return res.status(400).json({ ok: false, error: "missing user" });
 
       const merchants = await scanGmailMerchants(user);
+      const uniqueMerchants = Array.from(new Set(merchants));
 
       // store scanned merchants in auth_merchants table for review
       await supabaseAdmin.from("auth_merchants").delete().eq("user_id", user);
-      if (merchants.length > 0) {
-        const payload = merchants.map((m) => ({ user_id: user, merchant: m }));
+      if (uniqueMerchants.length > 0) {
+        const payload = uniqueMerchants.map((m) => ({ user_id: user, merchant: m }));
         await supabaseAdmin
           .from("auth_merchants")
           .upsert(payload, { onConflict: "user_id,merchant" });
       }
 
-      return res.status(200).json({ ok: true, merchants });
+      return res.status(200).json({ ok: true, merchants: uniqueMerchants });
     }
 
     if (req.method === "POST") {

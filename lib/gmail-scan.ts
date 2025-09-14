@@ -1,5 +1,6 @@
 // lib/gmail-scan.ts
 import { google } from "googleapis";
+import { parse } from "tldts";
 import { supabaseAdmin } from "./supabase-admin.js";
 
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID || "";
@@ -45,28 +46,54 @@ export async function getAccessToken(
 
 function extractDomain(from: string): string | null {
   const match = from.match(/@([^>\s]+)/);
-  return match ? match[1].toLowerCase() : null;
+  if (!match) return null;
+  const parsed = parse(match[1].toLowerCase());
+  return parsed.domain || null;
 }
 
-export async function scanGmailMerchants(userId: string): Promise<string[]> {
+export async function scanGmailMerchants(
+  userId: string,
+  limit = Number(process.env.GMAIL_SCAN_LIMIT || 250)
+): Promise<string[]> {
   const tokens = await getAccessToken(userId);
   if (!tokens) return [];
   const { client } = tokens;
   const gmail = google.gmail({ version: "v1", auth: client });
 
-  const list = await gmail.users.messages.list({ userId: "me", maxResults: 50, labelIds: ["INBOX"] });
-  const messages = list.data.messages || [];
   const merchants = new Set<string>();
+  let pageToken: string | undefined;
+  let fetched = 0;
 
-  for (const msg of messages) {
-    if (!msg.id) continue;
-    const res = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "metadata", metadataHeaders: ["From"] });
-    const headers = res.data.payload?.headers || [];
-    const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
-    if (!from) continue;
-    const domain = extractDomain(from);
-    if (!domain || domain.includes('amazon.')) continue;
-    merchants.add(domain);
+  while (fetched < limit) {
+    const res = await gmail.users.messages.list({
+      userId: "me",
+      labelIds: ["INBOX"],
+      maxResults: Math.min(500, limit - fetched),
+      pageToken,
+    });
+
+    const messages = res.data.messages || [];
+    if (messages.length === 0) break;
+
+    for (const msg of messages) {
+      if (!msg.id) continue;
+      const meta = await gmail.users.messages.get({
+        userId: "me",
+        id: msg.id,
+        format: "metadata",
+        metadataHeaders: ["From"],
+      });
+      const headers = meta.data.payload?.headers || [];
+      const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
+      if (!from) continue;
+      const domain = extractDomain(from);
+      if (!domain || domain.includes("amazon.")) continue;
+      merchants.add(domain);
+    }
+
+    fetched += messages.length;
+    if (!res.data.nextPageToken) break;
+    pageToken = res.data.nextPageToken;
   }
 
   return Array.from(merchants);
