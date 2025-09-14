@@ -166,30 +166,20 @@ async function processMessage(
   });
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== "POST" && req.method !== "GET") {
-    res.setHeader("Allow", "GET,POST");
-    return res.status(405).end();
-  }
-
-  const userFilter = (req.query.user as string) || "";
-  let query = supabaseAdmin
+export async function ingestUserReceipts(userId: string): Promise<void> {
+  const { data, error } = await supabaseAdmin
     .from("approved_merchants")
-    .select("user_id, merchant");
-  if (userFilter) query = query.eq("user_id", userFilter);
-  const { data, error } = await query;
+    .select("merchant")
+    .eq("user_id", userId);
+  if (error || !data) return;
 
-  if (error || !data) {
-    return res.status(500).json({ ok: false, error: error?.message });
-  }
+  const tokens = await getAccessToken(userId);
+  if (!tokens) return;
+
+  const gmail = google.gmail({ version: "v1", auth: tokens.client });
 
   for (const row of data) {
-    const userId = row.user_id as string;
     const merchant = row.merchant as string;
-    const tokens = await getAccessToken(userId);
-    if (!tokens) continue;
-    const gmail = google.gmail({ version: "v1", auth: tokens.client });
-
     const query = `from:${merchant} is:unread`;
     const list = await withRetry(
       () => gmail.users.messages.list({ userId: "me", q: query }),
@@ -200,6 +190,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!msg.id) continue;
       await processMessage(gmail, userId, merchant, msg.id);
     }
+  }
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  if (req.method !== "POST" && req.method !== "GET") {
+    res.setHeader("Allow", "GET,POST");
+    return res.status(405).end();
+  }
+
+  const userFilter = (req.query.user as string) || "";
+  if (userFilter) {
+    await ingestUserReceipts(userFilter);
+    return res.status(200).json({ ok: true });
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("approved_merchants")
+    .select("user_id");
+
+  if (error || !data) {
+    return res.status(500).json({ ok: false, error: error?.message });
+  }
+
+  const userIds = Array.from(new Set((data as any[]).map((r) => r.user_id as string)));
+  for (const uid of userIds) {
+    await ingestUserReceipts(uid);
   }
 
   return res.status(200).json({ ok: true });

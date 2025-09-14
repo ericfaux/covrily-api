@@ -3,6 +3,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { scanGmailMerchants } from "../../lib/gmail-scan.js";
 import { saveApprovedMerchants } from "../../lib/merchants.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
+import { ingestUserReceipts } from "./ingest.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -33,6 +34,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
 
       await saveApprovedMerchants(user, merchants);
+      await ingestUserReceipts(user);
       return res.status(200).json({ ok: true });
     }
 
