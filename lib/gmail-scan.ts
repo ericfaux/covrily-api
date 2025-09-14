@@ -43,9 +43,20 @@ export async function getAccessToken(
   return { client, accessToken: token };
 }
 
+const KEYWORDS = /(receipt|order|invoice|purchase|bill|transaction)/i;
+
+function rootDomain(domain: string): string {
+  const parts = domain.toLowerCase().split(".");
+  return parts.length <= 2 ? domain.toLowerCase() : parts.slice(-2).join(".");
+}
+
 function extractDomain(from: string): string | null {
   const match = from.match(/@([^>\s]+)/);
-  return match ? match[1].toLowerCase() : null;
+  if (!match) return null;
+  const domain = rootDomain(match[1]);
+  // ignore amazon domains
+  if (/amazon\./i.test(domain)) return null;
+  return domain;
 }
 
 export async function scanGmailMerchants(userId: string): Promise<string[]> {
@@ -54,18 +65,53 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
   const { client } = tokens;
   const gmail = google.gmail({ version: "v1", auth: client });
 
-  const list = await gmail.users.messages.list({ userId: "me", maxResults: 50, labelIds: ["INBOX"] });
-  const messages = list.data.messages || [];
-  const merchants = new Set<string>();
+  const date = new Date();
+  date.setFullYear(date.getFullYear() - 1);
+  const dateStr = `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
+  const query = `(receipt OR order OR invoice OR purchase OR bill OR transaction) after:${dateStr}`;
 
-  for (const msg of messages) {
-    if (!msg.id) continue;
-    const res = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "metadata", metadataHeaders: ["From"] });
-    const headers = res.data.payload?.headers || [];
-    const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
-    if (!from) continue;
-    const domain = extractDomain(from);
-    if (domain) merchants.add(domain);
+  const merchants = new Set<string>();
+  let pageToken: string | undefined;
+  const MAX_PAGES = 5; // cap to avoid long-running scans
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const { data } = await gmail.users.messages.list({
+      userId: "me",
+      q: query,
+      maxResults: 500,
+      pageToken,
+      labelIds: ["INBOX"],
+    });
+    const messages = data.messages || [];
+    if (messages.length === 0) break;
+
+    // fetch headers in small concurrent batches
+    for (let i = 0; i < messages.length; i += 10) {
+      const slice = messages.slice(i, i + 10);
+      const results = await Promise.allSettled(
+        slice.map((m) =>
+          gmail.users.messages.get({
+            userId: "me",
+            id: m.id!,
+            format: "metadata",
+            metadataHeaders: ["From", "Subject"],
+          })
+        )
+      );
+
+      for (const r of results) {
+        if (r.status !== "fulfilled") continue;
+        const headers = r.value.data.payload?.headers || [];
+        const from = headers.find((h: any) => h.name?.toLowerCase() === "from")?.value;
+        const subject = headers.find((h: any) => h.name?.toLowerCase() === "subject")?.value || "";
+        if (!from || !KEYWORDS.test(subject)) continue;
+        const domain = extractDomain(from);
+        if (domain) merchants.add(domain);
+      }
+    }
+
+    if (!data.nextPageToken) break;
+    pageToken = data.nextPageToken;
   }
 
   return Array.from(merchants);

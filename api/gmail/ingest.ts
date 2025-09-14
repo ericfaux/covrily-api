@@ -1,5 +1,5 @@
 // api/gmail/ingest.ts
-// Fetch unread Gmail messages for authorized merchants and store receipts
+// Fetch unread Gmail messages for approved merchants and store receipts
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { google } from "googleapis";
@@ -45,6 +45,33 @@ function extractText(part: any): string {
   return "";
 }
 
+async function isReceiptLLM(text: string): Promise<boolean> {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return true;
+  try {
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-3.5-turbo",
+        messages: [
+          { role: "system", content: "Determine if the following email is a purchase receipt. Respond with yes or no." },
+          { role: "user", content: text.slice(0, 4000) },
+        ],
+        max_tokens: 1,
+      }),
+    });
+    const data: any = await resp.json();
+    const answer = data?.choices?.[0]?.message?.content?.toLowerCase() || "";
+    return answer.includes("yes");
+  } catch {
+    return true;
+  }
+}
+
 async function processMessage(
   gmail: any,
   userId: string,
@@ -61,6 +88,11 @@ async function processMessage(
   const headers = payload.headers || [];
   const subject = headers.find((h: any) => (h.name || "").toLowerCase() === "subject")?.value || "";
   const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value || "";
+
+  const text = extractText(payload);
+  const combined = `${subject}\n${text}`;
+  const isReceipt = await isReceiptLLM(combined);
+  if (!isReceipt) return;
 
   let parsed: ParsedReceipt | null = null;
 
@@ -82,8 +114,7 @@ async function processMessage(
   }
 
   if (!parsed) {
-    const text = extractText(payload);
-    parsed = naiveParse(`${subject}\n${text}`, from);
+    parsed = naiveParse(combined, from);
   }
 
   const { merchant: m, order_id, purchase_date, total_cents } = parsed;
@@ -131,9 +162,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).end();
   }
 
-  const { data, error } = await supabaseAdmin
-    .from("auth_merchants")
+  const userFilter = (req.query.user as string) || "";
+  let query = supabaseAdmin
+    .from("approved_merchants")
     .select("user_id, merchant");
+  if (userFilter) query = query.eq("user_id", userFilter);
+  const { data, error } = await query;
 
   if (error || !data) {
     return res.status(500).json({ ok: false, error: error?.message });
