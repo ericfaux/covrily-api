@@ -66,13 +66,14 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
 
   const merchants = new Set<string>();
   let pageToken: string | undefined;
+  let processed = 0;
 
-  while (true) {
+  while (processed < 100) {
     const res = await gmail.users.messages.list({
       userId: "me",
       labelIds: ["INBOX"],
       q,
-      maxResults: 500,
+      maxResults: Math.min(100 - processed, 500),
       pageToken,
     });
 
@@ -80,6 +81,7 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
     if (messages.length === 0) break;
 
     for (const msg of messages) {
+      if (processed >= 100) break;
       if (!msg.id) continue;
       const meta = await gmail.users.messages.get({
         userId: "me",
@@ -92,13 +94,14 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
       const subject = headers
         .find((h: any) => (h.name || "").toLowerCase() === "subject")
         ?.value;
+      processed++;
       if (!from || !subject || !keywordRegex.test(subject)) continue;
       const domain = extractDomain(from);
       if (!domain || /amazon\./i.test(domain)) continue;
       merchants.add(domain);
     }
 
-    if (!res.data.nextPageToken) break;
+    if (processed >= 100 || !res.data.nextPageToken) break;
     pageToken = res.data.nextPageToken;
   }
 
