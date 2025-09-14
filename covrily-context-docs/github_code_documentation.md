@@ -108,3 +108,9 @@ This document describes the purpose of each file in the repository (excluding th
   - `/api/cron/heads-up` at 14:05 UTC daily
   - `/api/cron/purge-inbound` at 03:00 UTC Mondays
   - `/api/cron/price-watch` at 02:00 UTC daily
+ 
+## Gmail
+- **lib/gmail-scan.ts -This code scans for merchants in the users email that may have a possible receipt
+  - we need to sharpen this code so we return a more refine list of options for our users
+
+
