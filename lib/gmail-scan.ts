@@ -66,14 +66,18 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
 
   const merchants = new Set<string>();
   let pageToken: string | undefined;
-  let processed = 0;
+  let totalScanned = 0;
+  let qualifying = 0;
 
-  while (processed < 100) {
+  const MAX_QUALIFYING = 100;
+  const MAX_SCANNED = 500;
+
+  while (totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING) {
     const res = await gmail.users.messages.list({
       userId: "me",
       labelIds: ["INBOX"],
       q,
-      maxResults: Math.min(100 - processed, 500),
+      maxResults: Math.min(MAX_SCANNED - totalScanned, 500),
       pageToken,
     });
 
@@ -84,7 +88,11 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
     const ids = messages.map((m) => m.id).filter((id): id is string => !!id);
     const BATCH_SIZE = 10; // limit concurrent Gmail requests
 
-    for (let i = 0; i < ids.length && processed < 100; i += BATCH_SIZE) {
+    for (
+      let i = 0;
+      i < ids.length && totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING;
+      i += BATCH_SIZE
+    ) {
       const batchIds = ids.slice(i, i + BATCH_SIZE);
       const metas = await Promise.all(
         batchIds.map((id) =>
@@ -106,16 +114,22 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
         const subject = headers
           .find((h: any) => (h.name || "").toLowerCase() === "subject")
           ?.value;
-        processed++;
+        totalScanned++;
         if (!from || !subject || !keywordRegex.test(subject)) continue;
+        qualifying++;
         const domain = extractDomain(from);
         if (!domain || /amazon\./i.test(domain)) continue;
         merchants.add(domain);
-        if (processed >= 100) break;
+        if (totalScanned >= MAX_SCANNED || qualifying >= MAX_QUALIFYING) break;
       }
     }
 
-    if (processed >= 100 || !res.data.nextPageToken) break;
+    if (
+      totalScanned >= MAX_SCANNED ||
+      qualifying >= MAX_QUALIFYING ||
+      !res.data.nextPageToken
+    )
+      break;
     pageToken = res.data.nextPageToken;
   }
 
