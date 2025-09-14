@@ -60,6 +60,14 @@ export async function scanGmailMerchants(
   const { client } = tokens;
   const gmail = google.gmail({ version: "v1", auth: client });
 
+  const since = new Date();
+  since.setFullYear(since.getFullYear() - 1);
+  const dateStr = `${since.getFullYear()}/${String(since.getMonth() + 1).padStart(2, "0")}/${String(
+    since.getDate()
+  ).padStart(2, "0")}`;
+  const q = `(receipt OR order OR invoice OR purchase OR bill OR transaction) after:${dateStr}`;
+  const keywordRegex = /\b(receipt|order|invoice|purchase|bill|transaction)\b/i;
+
   const merchants = new Set<string>();
   let pageToken: string | undefined;
   let fetched = 0;
@@ -68,6 +76,7 @@ export async function scanGmailMerchants(
     const res = await gmail.users.messages.list({
       userId: "me",
       labelIds: ["INBOX"],
+      q,
       maxResults: Math.min(500, limit - fetched),
       pageToken,
     });
@@ -81,11 +90,14 @@ export async function scanGmailMerchants(
         userId: "me",
         id: msg.id,
         format: "metadata",
-        metadataHeaders: ["From"],
+        metadataHeaders: ["From", "Subject"],
       });
       const headers = meta.data.payload?.headers || [];
       const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
-      if (!from) continue;
+      const subject = headers
+        .find((h: any) => (h.name || "").toLowerCase() === "subject")
+        ?.value;
+      if (!from || !subject || !keywordRegex.test(subject)) continue;
       const domain = extractDomain(from);
       if (!domain || domain.includes("amazon.")) continue;
       merchants.add(domain);
