@@ -7,6 +7,7 @@ import parsePdf from "../../lib/pdf.js";
 import { naiveParse, type ParsedReceipt } from "../../lib/parse.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
 import { getAccessToken } from "../../lib/gmail-scan.js";
+import { withRetry } from "../../lib/retry.js";
 
 export const config = { runtime: "nodejs" };
 
@@ -78,11 +79,20 @@ async function processMessage(
   merchant: string,
   messageId: string
 ): Promise<void> {
-  const full = await gmail.users.messages.get({
-    userId: "me",
-    id: messageId,
-    format: "full",
-  });
+  let full;
+  try {
+    full = await withRetry(
+      () =>
+        gmail.users.messages.get({
+          userId: "me",
+          id: messageId,
+          format: "full",
+        }),
+      "users.messages.get"
+    );
+  } catch {
+    return;
+  }
 
   const payload = full.data.payload || {};
   const headers = payload.headers || [];
@@ -181,7 +191,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const gmail = google.gmail({ version: "v1", auth: tokens.client });
 
     const query = `from:${merchant} is:unread`;
-    const list = await gmail.users.messages.list({ userId: "me", q: query });
+    const list = await withRetry(
+      () => gmail.users.messages.list({ userId: "me", q: query }),
+      "users.messages.list"
+    );
     const msgs = list.data.messages || [];
     for (const msg of msgs) {
       if (!msg.id) continue;
