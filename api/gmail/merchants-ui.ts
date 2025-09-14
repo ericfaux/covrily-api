@@ -33,23 +33,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   <script>
     const user = ${JSON.stringify(user)};
     async function load(){
-      const r = await fetch('/api/gmail/merchants?user=' + encodeURIComponent(user));
-      const data = await r.json();
       const list = document.getElementById('list');
-      if (!data.merchants || data.merchants.length === 0) {
-        list.innerHTML = '<p>No merchants found.</p>';
-        return;
+      list.innerHTML = '<p>Loading...</p>';
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30000);
+        const r = await fetch('/api/gmail/merchants?user=' + encodeURIComponent(user), { signal: controller.signal });
+        clearTimeout(timeout);
+        const data = await r.json();
+        if (!data.merchants || data.merchants.length === 0) {
+          list.innerHTML = '<p>No merchants found.</p>';
+          return;
+        }
+        list.innerHTML = '';
+        (data.merchants || []).forEach(m => {
+          const label = document.createElement('label');
+          label.className = 'merchant';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.value = m;
+          label.appendChild(cb);
+          label.appendChild(document.createTextNode(m));
+          list.appendChild(label);
+        });
+      } catch (err) {
+        list.innerHTML = '<p style="color:red">Failed to load merchants.</p>';
       }
-      (data.merchants || []).forEach(m => {
-        const label = document.createElement('label');
-        label.className = 'merchant';
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.value = m;
-        label.appendChild(cb);
-        label.appendChild(document.createTextNode(m));
-        list.appendChild(label);
-      });
     }
     document.getElementById('save').onclick = async () => {
       const selected = Array.from(document.querySelectorAll('#list input[type="checkbox"]:checked')).map(cb => cb.value);
