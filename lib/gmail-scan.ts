@@ -9,7 +9,9 @@ const REDIRECT_URI = process.env.GMAIL_REDIRECT_URI || "";
 /**
  * Fetch a valid Gmail access token for the user.
  */
-async function getAccessToken(userId: string): Promise<{ client: any; accessToken: string } | null> {
+export async function getAccessToken(
+  userId: string
+): Promise<{ client: any; accessToken: string } | null> {
   const { data, error } = await supabaseAdmin
     .from("gmail_tokens")
     .select("refresh_token, access_token, access_token_expires_at")
