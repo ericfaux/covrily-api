@@ -144,3 +144,9 @@ CREATE TABLE public.receipts (
   CONSTRAINT receipts_pkey PRIMARY KEY (id),
   CONSTRAINT receipts_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
 );
+
+CREATE TABLE public.auth_merchants (
+  user_id uuid NOT NULL,
+  merchant text NOT NULL,
+  CONSTRAINT auth_merchants_pkey PRIMARY KEY (user_id, merchant)
+);
