@@ -11,26 +11,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   res.status(200).send(`<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8" /><title>Authorize Merchants</title></head>
+<head>
+  <meta charset="utf-8" />
+  <title>Authorize Merchants</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px auto; max-width: 600px; line-height: 1.6; }
+    h1 { text-align: center; }
+    #list { margin: 1rem 0; }
+    .merchant { display: flex; align-items: center; margin: 0.25rem 0; }
+    .merchant input { margin-right: 0.5rem; }
+    #save { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+  </style>
+</head>
 <body>
-  <div id="list"></div>
-  <button id="save">Save</button>
+  <main>
+    <h1>Select merchants</h1>
+    <p>Choose the merchants whose receipts you'd like to import.</p>
+    <div id="list"></div>
+    <button id="save">Save</button>
+  </main>
   <script>
     const user = ${JSON.stringify(user)};
     async function load(){
       const r = await fetch('/api/gmail/merchants?user=' + encodeURIComponent(user));
       const data = await r.json();
       const list = document.getElementById('list');
+      if (!data.merchants || data.merchants.length === 0) {
+        list.innerHTML = '<p>No merchants found.</p>';
+        return;
+      }
       (data.merchants || []).forEach(m => {
         const label = document.createElement('label');
+        label.className = 'merchant';
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.value = m;
         label.appendChild(cb);
-        label.appendChild(document.createTextNode(' ' + m));
-        const div = document.createElement('div');
-        div.appendChild(label);
-        list.appendChild(div);
+        label.appendChild(document.createTextNode(m));
+        list.appendChild(label);
       });
     }
     document.getElementById('save').onclick = async () => {
