@@ -1,6 +1,6 @@
 // lib/gmail-scan.ts
 import { google } from "googleapis";
-import { parse } from "tldts";
+import { getDomain } from "tldts";
 import { supabaseAdmin } from "./supabase-admin.js";
 
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID || "";
@@ -47,21 +47,17 @@ export async function getAccessToken(
 function extractDomain(from: string): string | null {
   const match = from.match(/@([^>\s]+)/);
   if (!match) return null;
-  const parsed = parse(match[1].toLowerCase());
-  return parsed.domain || null;
+  return getDomain(match[1].toLowerCase()) || null;
 }
 
-export async function scanGmailMerchants(
-  userId: string,
-  limit = Number(process.env.GMAIL_SCAN_LIMIT || 250)
-): Promise<string[]> {
+export async function scanGmailMerchants(userId: string): Promise<string[]> {
   const tokens = await getAccessToken(userId);
   if (!tokens) return [];
   const { client } = tokens;
   const gmail = google.gmail({ version: "v1", auth: client });
 
   const since = new Date();
-  since.setFullYear(since.getFullYear() - 1);
+  since.setMonth(since.getMonth() - 12);
   const dateStr = `${since.getFullYear()}/${String(since.getMonth() + 1).padStart(2, "0")}/${String(
     since.getDate()
   ).padStart(2, "0")}`;
@@ -70,14 +66,13 @@ export async function scanGmailMerchants(
 
   const merchants = new Set<string>();
   let pageToken: string | undefined;
-  let fetched = 0;
 
-  while (fetched < limit) {
+  while (true) {
     const res = await gmail.users.messages.list({
       userId: "me",
       labelIds: ["INBOX"],
       q,
-      maxResults: Math.min(500, limit - fetched),
+      maxResults: 500,
       pageToken,
     });
 
@@ -99,11 +94,10 @@ export async function scanGmailMerchants(
         ?.value;
       if (!from || !subject || !keywordRegex.test(subject)) continue;
       const domain = extractDomain(from);
-      if (!domain || domain.includes("amazon.")) continue;
+      if (!domain || /amazon\./i.test(domain)) continue;
       merchants.add(domain);
     }
 
-    fetched += messages.length;
     if (!res.data.nextPageToken) break;
     pageToken = res.data.nextPageToken;
   }
