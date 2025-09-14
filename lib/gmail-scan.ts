@@ -61,8 +61,8 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
   const dateStr = `${since.getFullYear()}/${String(since.getMonth() + 1).padStart(2, "0")}/${String(
     since.getDate()
   ).padStart(2, "0")}`;
-  const q = `(receipt OR order OR invoice OR purchase OR bill OR transaction) after:${dateStr}`;
-  const keywordRegex = /\b(receipt|order|invoice|purchase|bill|transaction)\b/i;
+  const q = `subject:(receipt OR order OR invoice OR purchase OR bill OR transaction OR payment OR confirmation OR statement OR "your order" OR "receipt for") (category:updates OR label:purchases) after:${dateStr}`;
+  const keywordRegex = /\b(receipt(?:\s+for)?|your\s+order|invoice|purchase|bill|transaction|payment|confirmation|statement|order)\b/i;
 
   const merchants = new Set<string>();
   let pageToken: string | undefined;
