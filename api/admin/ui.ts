@@ -52,6 +52,23 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
     </div>
   </section>
 
+  <!-- Gmail Auth -->
+  <section>
+    <h2>Gmail Auth</h2>
+    <div class="row">
+      <div class="col">
+        <label>User ID</label>
+        <input id="gmailUser" type="text" placeholder="UUID of users.id" />
+        <small id="gmailTokStatus" class="note"></small>
+      </div>
+      <div class="inline">
+        <button id="gmailCheck">Check</button>
+        <button id="gmailAuth">Auth</button>
+      </div>
+    </div>
+    <small class="note">Opens Gmail auth flow in a new tab.</small>
+  </section>
+
   <!-- Recent Receipts -->
   <section>
     <h2>Recent Receipts</h2>
@@ -147,6 +164,7 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
   const $ = (id)=>document.getElementById(id);
   const tokInp = $('tok');
   const out = $('out');
+  const gmailTokStatus = $('gmailTokStatus');
 
   function token(){ return tokInp.value.trim(); }
   function saveToken(){ localStorage.setItem('admin.token', token()); }
@@ -179,6 +197,23 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
   $('ping').onclick = async ()=>{
     await call('/api/diag/env?token='+encodeURIComponent(token()));
     await call('/api/health?token='+encodeURIComponent(token()));
+  };
+
+  // Gmail auth
+  $('gmailCheck').onclick = async ()=>{
+    const uid = $('gmailUser').value.trim();
+    if (!uid) return log('Set User ID first.');
+    const qs = new URLSearchParams({ user: uid, token: token() });
+    const r = await call('/api/admin/gmail-token?'+qs.toString());
+    if (r.body && typeof r.body.exists === 'boolean') {
+      gmailTokStatus.textContent = r.body.exists ? 'Token exists' : 'No token';
+      gmailTokStatus.style.color = r.body.exists ? 'var(--ok)' : 'var(--danger)';
+    }
+  };
+  $('gmailAuth').onclick = ()=>{
+    const uid = $('gmailUser').value.trim();
+    if (!uid) return log('Set User ID first.');
+    window.open('/api/gmail/auth?user='+encodeURIComponent(uid), '_blank');
   };
 
   // Recent: load & pick
