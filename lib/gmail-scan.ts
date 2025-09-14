@@ -2,6 +2,7 @@
 import { google } from "googleapis";
 import { getDomain } from "tldts";
 import { supabaseAdmin } from "./supabase-admin.js";
+import { withRetry } from "./retry.js";
 
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID || "";
 const CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET || "";
@@ -95,13 +96,17 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
   const MAX_SCANNED = 500;
 
   while (totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING) {
-    const res = await gmail.users.messages.list({
-      userId: "me",
-      labelIds: ["INBOX"],
-      q,
-      maxResults: Math.min(MAX_SCANNED - totalScanned, 500),
-      pageToken,
-    });
+    const res = await withRetry(
+      () =>
+        gmail.users.messages.list({
+          userId: "me",
+          labelIds: ["INBOX"],
+          q,
+          maxResults: Math.min(MAX_SCANNED - totalScanned, 500),
+          pageToken,
+        }),
+      "users.messages.list"
+    );
 
     const messages = res.data.messages || [];
     if (messages.length === 0) break;
@@ -119,14 +124,16 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
       const batchIds = ids.slice(i, i + BATCH_SIZE);
       const metas = await Promise.all(
         batchIds.map((id) =>
-          gmail.users.messages
-            .get({
-              userId: "me",
-              id,
-              format: "metadata",
-              metadataHeaders: ["From", "Subject"],
-            })
-            .catch(() => null)
+          withRetry(
+            () =>
+              gmail.users.messages.get({
+                userId: "me",
+                id,
+                format: "metadata",
+                metadataHeaders: ["From", "Subject"],
+              }),
+            "users.messages.get"
+          ).catch(() => null)
         )
       );
 
