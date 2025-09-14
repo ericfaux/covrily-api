@@ -8,6 +8,8 @@ import { naiveParse, type ParsedReceipt } from "../../lib/parse.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
 import { getAccessToken } from "../../lib/gmail-scan.js";
 import { withRetry } from "../../lib/retry.js";
+import extractReceipt from "../../lib/llm/extract-receipt.js";
+import { logParseResult } from "../../lib/parse-log.js";
 
 export const config = { runtime: "nodejs" };
 
@@ -105,6 +107,7 @@ async function processMessage(
   if (!isReceipt) return;
 
   let parsed: ParsedReceipt | null = null;
+  let fromPdf = false;
 
   const pdfPart = findPdfPart(payload);
   if (pdfPart) {
@@ -120,14 +123,57 @@ async function processMessage(
     } else if (pdfPart.body?.data) {
       buf = b64ToBuf(pdfPart.body.data);
     }
-    if (buf) parsed = await parsePdf(buf);
+    if (buf) {
+      parsed = await parsePdf(buf);
+      fromPdf = true;
+    }
   }
 
   if (!parsed) {
     parsed = naiveParse(combined, from);
   }
 
-  const { merchant: m, order_id, purchase_date, total_cents } = parsed;
+  let {
+    merchant: m,
+    order_id,
+    purchase_date,
+    total_cents,
+    tax_cents,
+    shipping_cents,
+  } = parsed as any;
+
+  const needsReceipt =
+    !m ||
+    m === "unknown" ||
+    !order_id ||
+    !purchase_date ||
+    total_cents == null ||
+    tax_cents == null ||
+    shipping_cents == null;
+
+  if (needsReceipt) {
+    const excerpt = (parsed as any).text_excerpt;
+    const llmText = [subject, combined, excerpt].filter(Boolean).join("\n\n");
+    const llm = await extractReceipt(llmText);
+    if (llm) {
+      if ((!m || m === "unknown") && llm.merchant) m = llm.merchant.toLowerCase();
+      if (!order_id && llm.order_id) order_id = llm.order_id;
+      if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
+      if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
+      if (tax_cents == null && llm.tax_cents != null) tax_cents = llm.tax_cents;
+      if (shipping_cents == null && llm.shipping_cents != null)
+        shipping_cents = llm.shipping_cents;
+    }
+  }
+
+  await logParseResult({
+    parser: fromPdf ? "pdf" : "naive",
+    merchant: m || "unknown",
+    order_id_found: !!order_id,
+    purchase_date_found: !!purchase_date,
+    total_cents_found: total_cents != null,
+  });
+
   const up = await supabaseAdmin
     .from("receipts")
     .upsert(
@@ -138,6 +184,8 @@ async function processMessage(
           order_id: order_id || "",
           purchase_date: purchase_date || null,
           total_cents: total_cents ?? null,
+          tax_cents: tax_cents ?? null,
+          shipping_cents: shipping_cents ?? null,
           raw_json: full.data,
         },
       ],
