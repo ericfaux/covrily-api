@@ -40,6 +40,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user, merchants: selected })
       });
+      await fetch('/api/gmail/ingest?user=' + encodeURIComponent(user), { method: 'POST' });
       alert('Saved');
     };
     load();

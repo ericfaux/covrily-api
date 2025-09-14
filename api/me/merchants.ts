@@ -9,7 +9,7 @@ export default async function handler(req: any, res: any) {
   });
 
   const { data: rows, error } = await supabase
-    .from("auth_merchants")
+    .from("approved_merchants")
     .select("merchant")
     .eq("user_id", user)
     .order("merchant", { ascending: true });

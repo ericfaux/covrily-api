@@ -32,7 +32,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         { onConflict: "user_id" }
       );
 
-    res.redirect(302, `/api/gmail/ui?user=${encodeURIComponent(user)}&status=linked`);
+    res.redirect(302, `/api/gmail/merchants-ui?user=${encodeURIComponent(user)}`);
   } catch (e: any) {
     const qs = user ? `user=${encodeURIComponent(user)}&` : "";
     res.redirect(302, `/api/gmail/ui?${qs}status=error`);
