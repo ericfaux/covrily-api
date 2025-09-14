@@ -11,16 +11,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   res.status(200).send(`<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8" /><title>Authorize Merchants</title></head>
+<head>
+  <meta charset="utf-8" />
+  <title>Authorize Merchants</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f5f5f5; }
+    .container { max-width: 600px; margin: 40px auto; background: #fff; padding: 24px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { margin-top: 0; font-size: 24px; color: #333; }
+    p { color: #555; }
+    #list div { margin: 8px 0; }
+    button { padding: 10px 20px; font-size: 16px; background: #0070f3; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #005bb5; }
+  </style>
+</head>
 <body>
-  <div id="list"></div>
-  <button id="save">Save</button>
+  <div class="container">
+    <h1>Select Merchants</h1>
+    <p>Choose which merchants you want Covrily to ingest receipts from.</p>
+    <div id="list">Loading...</div>
+    <button id="save">Save</button>
+  </div>
   <script>
     const user = ${JSON.stringify(user)};
-    async function load(){
+    async function load() {
       const r = await fetch('/api/gmail/merchants?user=' + encodeURIComponent(user));
       const data = await r.json();
       const list = document.getElementById('list');
+      list.innerHTML = '';
       (data.merchants || []).forEach(m => {
         const label = document.createElement('label');
         const cb = document.createElement('input');
@@ -32,6 +49,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         div.appendChild(label);
         list.appendChild(div);
       });
+      if (!data.merchants || data.merchants.length === 0) {
+        list.textContent = 'No merchants found.';
+      }
     }
     document.getElementById('save').onclick = async () => {
       const selected = Array.from(document.querySelectorAll('#list input[type="checkbox"]:checked')).map(cb => cb.value);
