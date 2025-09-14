@@ -65,7 +65,8 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
     const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
     if (!from) continue;
     const domain = extractDomain(from);
-    if (domain) merchants.add(domain);
+    if (!domain || domain.includes('amazon.')) continue;
+    merchants.add(domain);
   }
 
   return Array.from(merchants);
