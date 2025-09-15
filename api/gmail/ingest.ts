@@ -10,6 +10,8 @@ import { getAccessToken } from "../../lib/gmail-scan.js";
 import { withRetry } from "../../lib/retry.js";
 import extractReceipt from "../../lib/llm/extract-receipt.js";
 import { logParseResult } from "../../lib/parse-log.js";
+import extractReceiptLink from "../../lib/llm/extract-receipt-link.js";
+import { load } from "cheerio";
 
 export const config = { runtime: "nodejs" };
 
@@ -32,6 +34,51 @@ function findPdfPart(part: any): any | null {
     }
   }
   return null;
+}
+
+function findHtmlPart(part: any): any | null {
+  if (!part) return null;
+  if (part.mimeType === "text/html") return part;
+  if (Array.isArray(part.parts)) {
+    for (const p of part.parts) {
+      const found = findHtmlPart(p);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function gatherAnchors(html: string): string[] {
+  const $ = load(html);
+  const links: string[] = [];
+  $("a[href]").each((_, el) => {
+    const href = $(el).attr("href");
+    if (href) links.push(href);
+  });
+  return links;
+}
+
+async function findReceiptLink(payload: any, from: string): Promise<string | null> {
+  const htmlPart = findHtmlPart(payload);
+  const data = htmlPart?.body?.data;
+  if (!data) return null;
+  const html = b64ToBuf(data).toString("utf8");
+  const links = gatherAnchors(html);
+  if (links.length === 0) return null;
+  const senderDomain = (from.match(/@([^>\s]+)/)?.[1] || "").toLowerCase();
+  const filtered = links.filter((url) => {
+    try {
+      const u = new URL(url);
+      const domainMatch = senderDomain && u.hostname.toLowerCase().endsWith(senderDomain);
+      const keywordMatch = /(order|receipt|invoice|view)/i.test(url);
+      return domainMatch || keywordMatch;
+    } catch {
+      return false;
+    }
+  });
+  if (filtered.length === 0) return null;
+  if (filtered.length === 1) return filtered[0];
+  return await extractReceiptLink(filtered);
 }
 
 function extractText(part: any): string {
@@ -105,6 +152,9 @@ async function processMessage(
   const combined = `${subject}\n${text}`;
   const isReceipt = await isReceiptLLM(combined);
   if (!isReceipt) return;
+
+  const receiptLink = await findReceiptLink(payload, from);
+  if (receiptLink) (full.data as any).receipt_link = receiptLink;
 
   let parsed: ParsedReceipt | null = null;
   let fromPdf = false;
