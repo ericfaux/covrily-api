@@ -82,11 +82,54 @@ async function findReceiptLink(payload: any, from: string): Promise<string | nul
 }
 
 export async function fetchReceiptFromLink(
-  url: string
+  url: string,
+  meta?: {
+    user_id?: string;
+    message_id?: string;
+    merchant?: string;
+    subject?: string;
+    from?: string;
+  }
 ): Promise<ParsedReceipt | null> {
   try {
-    const resp = await withRetry(() => fetch(url), "fetch receipt link");
-    if (!resp.ok) return null;
+    const resp = await withRetry(
+      () => fetch(url, { redirect: "manual" }),
+      "fetch receipt link"
+    );
+
+    const status = resp.status;
+
+    if (
+      status === 401 ||
+      status === 403 ||
+      (status === 302 && /login|signin/i.test(resp.headers.get("location") || ""))
+    ) {
+      try {
+        await supabaseAdmin.from("pending_receipts").insert([
+          {
+            url,
+            user_id: meta?.user_id || null,
+            message_id: meta?.message_id || null,
+            merchant: meta?.merchant || null,
+            subject: meta?.subject || null,
+            from_header: meta?.from || null,
+            status_code: status,
+          },
+        ]);
+      } catch (e) {
+        console.error("[pending_receipts] insert failed:", e);
+      }
+      console.warn(
+        `[fetch-receipt-link] authentication required (${status}) for ${url}`
+      );
+      return null;
+    }
+
+    if (!resp.ok) {
+      console.warn(`[fetch-receipt-link] failed (${status}) for ${url}`);
+      return null;
+    }
+
     const type = resp.headers.get("content-type") || "";
     if (type.includes("application/pdf")) {
       const buf = Buffer.from(await resp.arrayBuffer());
@@ -128,7 +171,8 @@ export async function fetchReceiptFromLink(
       return parsed;
     }
     return null;
-  } catch {
+  } catch (e) {
+    console.error(`[fetch-receipt-link] error for ${url}:`, e);
     return null;
   }
 }
@@ -255,7 +299,13 @@ async function processMessage(
     receiptLink = await findReceiptLink(payload, from);
     if (receiptLink) {
       (full.data as any).receipt_link = receiptLink;
-      const linkParsed = await fetchReceiptFromLink(receiptLink);
+      const linkParsed = await fetchReceiptFromLink(receiptLink, {
+        user_id: userId,
+        message_id: messageId,
+        merchant: m || merchant,
+        subject,
+        from,
+      });
       if (linkParsed) {
         if ((!m || m === "unknown") && linkParsed.merchant) {
           m = linkParsed.merchant.toLowerCase();
