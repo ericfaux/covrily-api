@@ -81,6 +81,58 @@ async function findReceiptLink(payload: any, from: string): Promise<string | nul
   return await extractReceiptLink(filtered);
 }
 
+export async function fetchReceiptFromLink(
+  url: string
+): Promise<ParsedReceipt | null> {
+  try {
+    const resp = await withRetry(() => fetch(url), "fetch receipt link");
+    if (!resp.ok) return null;
+    const type = resp.headers.get("content-type") || "";
+    if (type.includes("application/pdf")) {
+      const buf = Buffer.from(await resp.arrayBuffer());
+      return await parsePdf(buf);
+    }
+    if (type.includes("text/html")) {
+      const html = await resp.text();
+      const text = stripHtml(html);
+      const host = (() => {
+        try {
+          return new URL(url).hostname;
+        } catch {
+          return "";
+        }
+      })();
+      let parsed = naiveParse(text, `no-reply@${host}`);
+      const needsReceipt =
+        !parsed.merchant ||
+        parsed.merchant === "unknown" ||
+        !parsed.order_id ||
+        !parsed.purchase_date ||
+        parsed.total_cents == null;
+      if (needsReceipt) {
+        const llm = await extractReceipt(text);
+        if (llm) {
+          if ((!parsed.merchant || parsed.merchant === "unknown") && llm.merchant)
+            parsed.merchant = llm.merchant.toLowerCase();
+          if (!parsed.order_id && llm.order_id) parsed.order_id = llm.order_id;
+          if (!parsed.purchase_date && llm.purchase_date)
+            parsed.purchase_date = llm.purchase_date;
+          if (parsed.total_cents == null && llm.total_cents != null)
+            parsed.total_cents = llm.total_cents;
+          if ((llm as any).tax_cents != null)
+            (parsed as any).tax_cents = (llm as any).tax_cents;
+          if ((llm as any).shipping_cents != null)
+            (parsed as any).shipping_cents = (llm as any).shipping_cents;
+        }
+      }
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function extractText(part: any): string {
   if (!part) return "";
   if (part.mimeType === "text/plain" && part.body?.data) {
@@ -177,6 +229,10 @@ async function processMessage(
       parsed = await parsePdf(buf);
       fromPdf = true;
     }
+  }
+
+  if (!parsed && receiptLink) {
+    parsed = await fetchReceiptFromLink(receiptLink);
   }
 
   if (!parsed) {
