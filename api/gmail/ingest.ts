@@ -204,10 +204,6 @@ async function processMessage(
   const combined = `${subject}\n${text}`;
   const isReceipt = await isReceiptLLM(combined);
   if (!isReceipt) return;
-
-  const receiptLink = await findReceiptLink(payload, from);
-  if (receiptLink) (full.data as any).receipt_link = receiptLink;
-
   let parsed: ParsedReceipt | null = null;
   let fromPdf = false;
 
@@ -231,13 +227,11 @@ async function processMessage(
     }
   }
 
-  if (!parsed && receiptLink) {
-    parsed = await fetchReceiptFromLink(receiptLink);
-  }
-
   if (!parsed) {
     parsed = naiveParse(combined, from);
   }
+
+  let receiptLink: string | null = null;
 
   let {
     merchant: m,
@@ -248,7 +242,56 @@ async function processMessage(
     shipping_cents,
   } = parsed as any;
 
-  const needsReceipt =
+  let needsReceipt =
+    !m ||
+    m === "unknown" ||
+    !order_id ||
+    !purchase_date ||
+    total_cents == null ||
+    tax_cents == null ||
+    shipping_cents == null;
+
+  if (needsReceipt) {
+    receiptLink = await findReceiptLink(payload, from);
+    if (receiptLink) {
+      (full.data as any).receipt_link = receiptLink;
+      const linkParsed = await fetchReceiptFromLink(receiptLink);
+      if (linkParsed) {
+        if ((!m || m === "unknown") && linkParsed.merchant) {
+          m = linkParsed.merchant.toLowerCase();
+          if (!(parsed as any).merchant) (parsed as any).merchant = linkParsed.merchant;
+        }
+        if (!order_id && linkParsed.order_id) {
+          order_id = linkParsed.order_id;
+          if (!(parsed as any).order_id) (parsed as any).order_id = linkParsed.order_id;
+        }
+        if (!purchase_date && linkParsed.purchase_date) {
+          purchase_date = linkParsed.purchase_date;
+          if (!(parsed as any).purchase_date)
+            (parsed as any).purchase_date = linkParsed.purchase_date;
+        }
+        if (total_cents == null && linkParsed.total_cents != null) {
+          total_cents = linkParsed.total_cents;
+          if ((parsed as any).total_cents == null)
+            (parsed as any).total_cents = linkParsed.total_cents;
+        }
+        if (tax_cents == null && (linkParsed as any).tax_cents != null) {
+          tax_cents = (linkParsed as any).tax_cents;
+          if ((parsed as any).tax_cents == null)
+            (parsed as any).tax_cents = (linkParsed as any).tax_cents;
+        }
+        if (shipping_cents == null && (linkParsed as any).shipping_cents != null) {
+          shipping_cents = (linkParsed as any).shipping_cents;
+          if ((parsed as any).shipping_cents == null)
+            (parsed as any).shipping_cents = (linkParsed as any).shipping_cents;
+        }
+        if (!(parsed as any).items && (linkParsed as any).items)
+          (parsed as any).items = (linkParsed as any).items;
+      }
+    }
+  }
+
+  needsReceipt =
     !m ||
     m === "unknown" ||
     !order_id ||
@@ -292,6 +335,7 @@ async function processMessage(
           total_cents: total_cents ?? null,
           tax_cents: tax_cents ?? null,
           shipping_cents: shipping_cents ?? null,
+          receipt_url: receiptLink,
           raw_json: full.data,
         },
       ],
