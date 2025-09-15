@@ -156,3 +156,17 @@ CREATE TABLE public.approved_merchants (
   merchant text NOT NULL,
   CONSTRAINT approved_merchants_pkey PRIMARY KEY (user_id, merchant)
 );
+
+CREATE TABLE public.pending_receipts (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id uuid,
+  message_id text,
+  url text NOT NULL,
+  merchant text,
+  subject text,
+  from_header text,
+  status_code integer,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT pending_receipts_pkey PRIMARY KEY (id),
+  CONSTRAINT pending_receipts_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
+);
