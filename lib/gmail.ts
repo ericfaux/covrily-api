@@ -10,12 +10,12 @@ const SCOPES = [
   "https://www.googleapis.com/auth/gmail.labels",
 ];
 
-function oauthClient() {
+export function createOAuthClient() {
   return new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 }
 
 export function getGmailAuthUrl(state: string): string {
-  const client = oauthClient();
+  const client = createOAuthClient();
   return client.generateAuthUrl({
     access_type: "offline",
     scope: SCOPES,
@@ -25,7 +25,7 @@ export function getGmailAuthUrl(state: string): string {
 }
 
 export async function exchangeCodeForTokens(code: string) {
-  const client = oauthClient();
+  const client = createOAuthClient();
   const { tokens } = await client.getToken(code);
   return tokens;
 }

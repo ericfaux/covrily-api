@@ -31,10 +31,82 @@ const LABEL_CREATION_SCOPES = new Set<string>([
   "https://www.googleapis.com/auth/gmail.labels",
 ]);
 
+const REQUIRED_WRITE_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.labels",
+  "https://www.googleapis.com/auth/gmail.modify",
+];
+
+const LABELING_ENABLED =
+  (process.env.GMAIL_LABELING_ENABLED || "").toLowerCase() === "true";
+
+class GmailReauthRequiredError extends Error {
+  public readonly statusCode = 428;
+  public readonly code = "reauth_required";
+  public readonly requiredScopes = REQUIRED_WRITE_SCOPES;
+  public readonly grantedScopes: string[];
+  public userId?: string;
+
+  constructor(grantedScopes: string[]) {
+    super("Gmail reauthorization required");
+    this.name = "GmailReauthRequiredError";
+    const unique = Array.from(
+      new Set(
+        grantedScopes
+          .map((scope) => (typeof scope === "string" ? scope.trim() : ""))
+          .filter((scope) => scope.length > 0)
+      )
+    );
+    this.grantedScopes = unique;
+  }
+}
+
+function isInsufficientScopeError(err: any): boolean {
+  if (!err) return false;
+  const status = err?.code ?? err?.response?.status ?? err?.status;
+  if (status !== 403) return false;
+
+  const candidates: any[] = [];
+  if (Array.isArray(err?.errors)) candidates.push(...err.errors);
+  const apiErrors = err?.response?.data?.error?.errors;
+  if (Array.isArray(apiErrors)) candidates.push(...apiErrors);
+  if (
+    candidates.some((item) => {
+      const reason = (item?.reason || "").toString().toLowerCase();
+      return reason.includes("insufficient") || reason.includes("permission");
+    })
+  ) {
+    return true;
+  }
+
+  const errorStatus = (err?.response?.data?.error?.status || "")
+    .toString()
+    .toLowerCase();
+  if (errorStatus === "permission_denied") {
+    const message = (err?.response?.data?.error?.message || "")
+      .toString()
+      .toLowerCase();
+    if (message.includes("insufficient") || message.includes("scope")) {
+      return true;
+    }
+  }
+
+  const message = (err?.message || err?.response?.data?.error?.message || "")
+    .toString()
+    .toLowerCase();
+  return message.includes("insufficient") && message.includes("scope");
+}
+
+function maybeThrowReauth(err: any, gmail: any): void {
+  if (!isInsufficientScopeError(err)) return;
+  const grantedScopes = gatherAvailableScopes(gmail);
+  throw new GmailReauthRequiredError(grantedScopes);
+}
+
 function gatherAvailableScopes(gmail: any): string[] {
   const scopeCandidates = [
     gmail?._options?.auth?.credentials?.scope,
     gmail?._options?.auth?.credentials?.scopes,
+    gmail?._options?.auth?.credentials?.granted_scopes,
     gmail?._options?.auth?.scopes,
   ];
   const scopeSet = new Set<string>();
@@ -86,10 +158,19 @@ function hasReceiptIndicators(text: string): boolean {
 }
 
 async function ensureProcessedLabel(gmail: any): Promise<string | null> {
+  if (!LABELING_ENABLED) return null;
   const availableScopes = gatherAvailableScopes(gmail);
+  if (availableScopes.length === 0) {
+    console.info("[gmail] skipping processed label (unknown scopes)");
+    return null;
+  }
   const hasLabelCreationScope = availableScopes.some((scope) =>
     LABEL_CREATION_SCOPES.has(scope)
   );
+  if (!hasLabelCreationScope) {
+    console.info("[gmail] skipping processed label (missing label scope)");
+    return null;
+  }
 
   const lookup = async () => {
     const labelsResp: any = await withRetry(
@@ -108,14 +189,8 @@ async function ensureProcessedLabel(gmail: any): Promise<string | null> {
     const existing = await lookup();
     if (existing) return existing;
   } catch (err) {
+    maybeThrowReauth(err, gmail);
     console.warn("[gmail] labels.list failed", err);
-  }
-
-  if (availableScopes.length > 0 && !hasLabelCreationScope) {
-    console.warn(
-      "[gmail] skipping processed label creation (missing label scope)"
-    );
-    return null;
   }
 
   try {
@@ -134,6 +209,7 @@ async function ensureProcessedLabel(gmail: any): Promise<string | null> {
     const id = createdResp?.data?.id;
     if (id) return id;
   } catch (err) {
+    maybeThrowReauth(err, gmail);
     const code = err?.code ?? err?.response?.status;
     if (code === 403) {
       const details =
@@ -152,6 +228,7 @@ async function ensureProcessedLabel(gmail: any): Promise<string | null> {
   try {
     return await lookup();
   } catch (err) {
+    maybeThrowReauth(err, gmail);
     console.warn("[gmail] labels.list retry failed", err);
     return null;
   }
@@ -462,7 +539,8 @@ async function processMessage(
         }),
       "users.messages.get"
     );
-  } catch {
+  } catch (err) {
+    maybeThrowReauth(err, gmail);
     return;
   }
 
@@ -492,13 +570,18 @@ async function processMessage(
     if (pdfPart) {
       let buf: Buffer | null = null;
       if (pdfPart.body?.attachmentId) {
-        const att = await gmail.users.messages.attachments.get({
-          userId: "me",
-          messageId,
-          id: pdfPart.body.attachmentId,
-        });
-        const data = att.data.data as string | undefined;
-        if (data) buf = b64ToBuf(data);
+        try {
+          const att = await gmail.users.messages.attachments.get({
+            userId: "me",
+            messageId,
+            id: pdfPart.body.attachmentId,
+          });
+          const data = att?.data?.data as string | undefined;
+          if (data) buf = b64ToBuf(data);
+        } catch (err) {
+          maybeThrowReauth(err, gmail);
+          console.warn("[gmail] failed to load attachment", err);
+        }
       } else if (pdfPart.body?.data) {
         buf = b64ToBuf(pdfPart.body.data);
       }
@@ -683,6 +766,7 @@ async function modifyMessageLabels(
       requestBody,
     });
   } catch (err) {
+    maybeThrowReauth(err, gmail);
     console.warn("[gmail] failed to modify labels", err);
   }
 }
@@ -693,48 +777,98 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).end();
   }
 
-  const userFilter = (req.query.user as string) || "";
-  let query = supabaseAdmin
-    .from("approved_merchants")
-    .select("user_id, merchant");
-  if (userFilter) query = query.eq("user_id", userFilter);
-  const { data, error } = await query;
+  try {
+    const userFilter = (req.query.user as string) || "";
+    let query = supabaseAdmin
+      .from("approved_merchants")
+      .select("user_id, merchant");
+    if (userFilter) query = query.eq("user_id", userFilter);
+    const { data, error } = await query;
 
-  if (error || !data) {
-    return res.status(500).json({ ok: false, error: error?.message });
+    if (error || !data) {
+      return res.status(500).json({ ok: false, error: error?.message });
+    }
+
+    const processedLabelCache = new Map<string, string | null>();
+
+    for (const row of data) {
+      const userId = row.user_id as string;
+      const merchant = row.merchant as string;
+      const tokens = await getAccessToken(userId);
+      if (!tokens) continue;
+
+      if (tokens.status && tokens.status.toLowerCase() === "reauth_required") {
+        const err = new GmailReauthRequiredError(tokens.grantedScopes || []);
+        err.userId = userId;
+        throw err;
+      }
+
+      const gmail = google.gmail({ version: "v1", auth: tokens.client });
+
+      try {
+        let processedLabelId = processedLabelCache.get(userId);
+        if (processedLabelId === undefined) {
+          processedLabelId = await ensureProcessedLabel(gmail);
+          processedLabelCache.set(userId, processedLabelId ?? null);
+        }
+
+        const terms = [`from:${merchant}`];
+        if (processedLabelId) {
+          terms.push(`-label:${PROCESSED_LABEL_NAME}`);
+        }
+        const q = terms.join(" ");
+        let list: any;
+        try {
+          list = await withRetry(
+            () => gmail.users.messages.list({ userId: "me", q }),
+            "users.messages.list"
+          );
+        } catch (err) {
+          maybeThrowReauth(err, gmail);
+          throw err;
+        }
+        const msgs = list.data.messages || [];
+        for (const msg of msgs) {
+          if (!msg.id) continue;
+          try {
+            await processMessage(gmail, userId, merchant, msg.id, processedLabelId);
+          } catch (err) {
+            if (err instanceof GmailReauthRequiredError) {
+              err.userId = userId;
+            }
+            throw err;
+          }
+        }
+      } catch (err) {
+        if (err instanceof GmailReauthRequiredError) {
+          err.userId = userId;
+        }
+        throw err;
+      }
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (err: any) {
+    if (err instanceof GmailReauthRequiredError) {
+      if (err.userId) {
+        try {
+          await supabaseAdmin
+            .from("gmail_tokens")
+            .update({ status: "reauth_required", granted_scopes: err.grantedScopes })
+            .eq("user_id", err.userId);
+        } catch (updateErr) {
+          console.error("[gmail] failed to flag reauth requirement", updateErr);
+        }
+      }
+      return res.status(err.statusCode).json({
+        ok: false,
+        code: err.code,
+        requiredScopes: err.requiredScopes,
+        grantedScopes: err.grantedScopes,
+      });
+    }
+    console.error("[gmail] ingest failed", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
   }
-
-  const processedLabelCache = new Map<string, string | null>();
-
-  for (const row of data) {
-    const userId = row.user_id as string;
-    const merchant = row.merchant as string;
-    const tokens = await getAccessToken(userId);
-    if (!tokens) continue;
-    const gmail = google.gmail({ version: "v1", auth: tokens.client });
-
-    let processedLabelId = processedLabelCache.get(userId);
-    if (processedLabelId === undefined) {
-      processedLabelId = await ensureProcessedLabel(gmail);
-      processedLabelCache.set(userId, processedLabelId ?? null);
-    }
-
-    const terms = [`from:${merchant}`];
-    if (processedLabelId) {
-      terms.push(`-label:${PROCESSED_LABEL_NAME}`);
-    }
-    const query = terms.join(" ");
-    const list = await withRetry(
-      () => gmail.users.messages.list({ userId: "me", q: query }),
-      "users.messages.list"
-    );
-    const msgs = list.data.messages || [];
-    for (const msg of msgs) {
-      if (!msg.id) continue;
-      await processMessage(gmail, userId, merchant, msg.id, processedLabelId);
-    }
-  }
-
-  return res.status(200).json({ ok: true });
 }
 
