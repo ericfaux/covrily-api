@@ -18,11 +18,43 @@ import { load } from "cheerio";
 export const config = { runtime: "nodejs" };
 
 const PROCESSED_LABEL_NAME = "CovrilyProcessed";
-const LABEL_CREATION_SCOPES = new Set([
+const FULL_MAILBOX_SCOPES = [
   "https://mail.google.com/",
+  "https://mail.google.com",
+] as const;
+const MODIFY_SCOPES = new Set<string>([
+  ...FULL_MAILBOX_SCOPES,
   "https://www.googleapis.com/auth/gmail.modify",
+]);
+const LABEL_CREATION_SCOPES = new Set<string>([
+  ...FULL_MAILBOX_SCOPES,
   "https://www.googleapis.com/auth/gmail.labels",
 ]);
+
+function gatherAvailableScopes(gmail: any): string[] {
+  const scopeCandidates = [
+    gmail?._options?.auth?.credentials?.scope,
+    gmail?._options?.auth?.credentials?.scopes,
+    gmail?._options?.auth?.scopes,
+  ];
+  const scopeSet = new Set<string>();
+  for (const candidate of scopeCandidates) {
+    if (!candidate) continue;
+    if (Array.isArray(candidate)) {
+      for (const scope of candidate) {
+        if (typeof scope === "string" && scope.trim()) {
+          scopeSet.add(scope.trim());
+        }
+      }
+    } else if (typeof candidate === "string") {
+      for (const scope of candidate.split(/\s+/)) {
+        const trimmed = scope.trim();
+        if (trimmed) scopeSet.add(trimmed);
+      }
+    }
+  }
+  return Array.from(scopeSet);
+}
 
 interface AnchorCandidate {
   href: string;
@@ -54,28 +86,7 @@ function hasReceiptIndicators(text: string): boolean {
 }
 
 async function ensureProcessedLabel(gmail: any): Promise<string | null> {
-  const scopeCandidates = [
-    gmail?._options?.auth?.credentials?.scope,
-    gmail?._options?.auth?.credentials?.scopes,
-    gmail?._options?.auth?.scopes,
-  ];
-  const scopeSet = new Set<string>();
-  for (const candidate of scopeCandidates) {
-    if (!candidate) continue;
-    if (Array.isArray(candidate)) {
-      for (const scope of candidate) {
-        if (typeof scope === "string" && scope.trim()) {
-          scopeSet.add(scope.trim());
-        }
-      }
-    } else if (typeof candidate === "string") {
-      for (const scope of candidate.split(/\s+/)) {
-        const trimmed = scope.trim();
-        if (trimmed) scopeSet.add(trimmed);
-      }
-    }
-  }
-  const availableScopes = Array.from(scopeSet);
+  const availableScopes = gatherAvailableScopes(gmail);
   const hasLabelCreationScope = availableScopes.some((scope) =>
     LABEL_CREATION_SCOPES.has(scope)
   );
@@ -652,6 +663,15 @@ async function modifyMessageLabels(
 ) {
   const shouldModify = markRead || (shouldLabel && processedLabelId);
   if (!shouldModify) return;
+  const availableScopes = gatherAvailableScopes(gmail);
+  const canModify = availableScopes.some((scope) => MODIFY_SCOPES.has(scope));
+  if (!canModify) {
+    console.warn(
+      "[gmail] skipping label modifications (missing modify scope)",
+      messageId
+    );
+    return;
+  }
   const requestBody: Record<string, any> = {};
   if (markRead) requestBody.removeLabelIds = ["UNREAD"];
   if (shouldLabel && processedLabelId) requestBody.addLabelIds = [processedLabelId];

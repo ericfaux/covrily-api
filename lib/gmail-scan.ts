@@ -31,6 +31,30 @@ export async function getAccessToken(
   const { token } = await client.getAccessToken();
   if (!token) return null;
 
+  let tokenScopes: string[] | null = null;
+  try {
+    const info = await client.getTokenInfo(token);
+    if (info?.scopes && Array.isArray(info.scopes)) {
+      tokenScopes = info.scopes
+        .map((scope) => (typeof scope === "string" ? scope.trim() : ""))
+        .filter((scope) => scope.length > 0);
+    } else if (info && typeof (info as any).scope === "string") {
+      tokenScopes = (info as any).scope
+        .split(/\s+/)
+        .map((scope: string) => scope.trim())
+        .filter((scope: string) => scope.length > 0);
+    }
+  } catch (err) {
+    console.warn("[gmail] failed to fetch token info", err);
+  }
+
+  if (tokenScopes && tokenScopes.length > 0) {
+    const uniqueScopes = Array.from(new Set(tokenScopes));
+    (client.credentials as any).scopes = uniqueScopes;
+    (client.credentials as any).scope = uniqueScopes.join(" ");
+    (client as any).scopes = uniqueScopes;
+  }
+
   // persist new access token if it changed
   if (token !== accessToken) {
     const expiryDate = client.credentials.expiry_date
