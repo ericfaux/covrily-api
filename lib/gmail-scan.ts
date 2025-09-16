@@ -11,12 +11,21 @@ const REDIRECT_URI = process.env.GMAIL_REDIRECT_URI || "";
 /**
  * Fetch a valid Gmail access token for the user.
  */
+export interface GmailAccessTokenResult {
+  client: any;
+  accessToken: string;
+  grantedScopes: string[];
+  status: string | null;
+}
+
 export async function getAccessToken(
   userId: string
-): Promise<{ client: any; accessToken: string } | null> {
+): Promise<GmailAccessTokenResult | null> {
   const { data, error } = await supabaseAdmin
     .from("gmail_tokens")
-    .select("refresh_token, access_token, access_token_expires_at")
+    .select(
+      "refresh_token, access_token, access_token_expires_at, granted_scopes, status"
+    )
     .eq("user_id", userId)
     .maybeSingle();
 
@@ -32,6 +41,12 @@ export async function getAccessToken(
   if (!token) return null;
 
   let tokenScopes: string[] | null = null;
+  const storedScopes = Array.isArray((data as any).granted_scopes)
+    ? ((data as any).granted_scopes as any[])
+        .map((scope) => (typeof scope === "string" ? scope.trim() : ""))
+        .filter((scope): scope is string => scope.length > 0)
+    : [];
+  let grantedScopes = storedScopes;
   try {
     const info = await client.getTokenInfo(token);
     if (info?.scopes && Array.isArray(info.scopes)) {
@@ -50,9 +65,14 @@ export async function getAccessToken(
 
   if (tokenScopes && tokenScopes.length > 0) {
     const uniqueScopes = Array.from(new Set(tokenScopes));
+    grantedScopes = uniqueScopes;
     (client.credentials as any).scopes = uniqueScopes;
     (client.credentials as any).scope = uniqueScopes.join(" ");
     (client as any).scopes = uniqueScopes;
+  } else if (grantedScopes.length > 0) {
+    (client.credentials as any).scopes = grantedScopes;
+    (client.credentials as any).scope = grantedScopes.join(" ");
+    (client as any).scopes = grantedScopes;
   }
 
   // persist new access token if it changed
@@ -62,11 +82,29 @@ export async function getAccessToken(
       : null;
     await supabaseAdmin
       .from("gmail_tokens")
-      .update({ access_token: token, access_token_expires_at: expiryDate })
+      .update({
+        access_token: token,
+        access_token_expires_at: expiryDate,
+        granted_scopes: grantedScopes,
+      })
+      .eq("user_id", userId);
+  } else if (
+    tokenScopes &&
+    tokenScopes.length > 0 &&
+    ([...storedScopes].sort().join("|") !== [...grantedScopes].sort().join("|"))
+  ) {
+    await supabaseAdmin
+      .from("gmail_tokens")
+      .update({ granted_scopes: grantedScopes })
       .eq("user_id", userId);
   }
 
-  return { client, accessToken: token };
+  return {
+    client,
+    accessToken: token,
+    grantedScopes,
+    status: ((data as any).status as string | null) || null,
+  };
 }
 
 function extractDomain(from: string): string | null {
