@@ -18,6 +18,11 @@ import { load } from "cheerio";
 export const config = { runtime: "nodejs" };
 
 const PROCESSED_LABEL_NAME = "CovrilyProcessed";
+const LABEL_CREATION_SCOPES = new Set([
+  "https://mail.google.com/",
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/gmail.labels",
+]);
 
 interface AnchorCandidate {
   href: string;
@@ -49,6 +54,32 @@ function hasReceiptIndicators(text: string): boolean {
 }
 
 async function ensureProcessedLabel(gmail: any): Promise<string | null> {
+  const scopeCandidates = [
+    gmail?._options?.auth?.credentials?.scope,
+    gmail?._options?.auth?.credentials?.scopes,
+    gmail?._options?.auth?.scopes,
+  ];
+  const scopeSet = new Set<string>();
+  for (const candidate of scopeCandidates) {
+    if (!candidate) continue;
+    if (Array.isArray(candidate)) {
+      for (const scope of candidate) {
+        if (typeof scope === "string" && scope.trim()) {
+          scopeSet.add(scope.trim());
+        }
+      }
+    } else if (typeof candidate === "string") {
+      for (const scope of candidate.split(/\s+/)) {
+        const trimmed = scope.trim();
+        if (trimmed) scopeSet.add(trimmed);
+      }
+    }
+  }
+  const availableScopes = Array.from(scopeSet);
+  const hasLabelCreationScope = availableScopes.some((scope) =>
+    LABEL_CREATION_SCOPES.has(scope)
+  );
+
   const lookup = async () => {
     const labelsResp: any = await withRetry(
       () => gmail.users.labels.list({ userId: "me" }),
@@ -69,6 +100,13 @@ async function ensureProcessedLabel(gmail: any): Promise<string | null> {
     console.warn("[gmail] labels.list failed", err);
   }
 
+  if (availableScopes.length > 0 && !hasLabelCreationScope) {
+    console.warn(
+      "[gmail] skipping processed label creation (missing label scope)"
+    );
+    return null;
+  }
+
   try {
     const createdResp: any = await withRetry(
       () =>
@@ -85,7 +123,19 @@ async function ensureProcessedLabel(gmail: any): Promise<string | null> {
     const id = createdResp?.data?.id;
     if (id) return id;
   } catch (err) {
-    console.warn("[gmail] labels.create failed", err);
+    const code = err?.code ?? err?.response?.status;
+    if (code === 403) {
+      const details =
+        err?.errors?.[0]?.message ??
+        err?.response?.data?.error?.message ??
+        err?.message ??
+        "insufficient permissions";
+      console.warn(
+        `[gmail] skipping processed label creation (${String(details)})`
+      );
+    } else {
+      console.warn("[gmail] labels.create failed", err);
+    }
   }
 
   try {
