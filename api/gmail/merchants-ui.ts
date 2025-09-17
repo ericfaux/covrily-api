@@ -40,6 +40,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const timeout = setTimeout(() => controller.abort(), 30000);
         const r = await fetch('/api/gmail/merchants?user=' + encodeURIComponent(user), { signal: controller.signal });
         clearTimeout(timeout);
+        if (r.status === 428) {
+          window.location.href = '/api/gmail/ui?user=' + encodeURIComponent(user);
+          return;
+        }
+        if (!r.ok) {
+          throw new Error('failed to load');
+        }
         const data = await r.json();
         if (!data.merchants || data.merchants.length === 0) {
           list.innerHTML = '<p>No merchants found.</p>';
