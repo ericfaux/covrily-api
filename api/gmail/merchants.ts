@@ -1,6 +1,6 @@
 // api/gmail/merchants.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { scanGmailMerchants } from "../../lib/gmail-scan.js";
+import { getAccessToken, scanGmailMerchants } from "../../lib/gmail-scan.js";
 import { saveApprovedMerchants } from "../../lib/merchants.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
 
@@ -10,7 +10,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const user = (req.query.user as string) || "";
       if (!user) return res.status(400).json({ ok: false, error: "missing user" });
 
-      const merchants = await scanGmailMerchants(user);
+      const tokens = await getAccessToken(user);
+      const status = tokens?.status ? String(tokens.status).toLowerCase() : null;
+      if (!tokens || !tokens.accessToken || status === "reauth_required") {
+        return res.status(428).json({ ok: false, error: "reauth_required" });
+      }
+
+      const merchants = await scanGmailMerchants(user, tokens);
       const uniqueMerchants = Array.from(new Set(merchants));
 
       // store scanned merchants in auth_merchants table for review

@@ -135,9 +135,16 @@ function isGenericDomain(domain: string): boolean {
   return GENERIC_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`));
 }
 
-export async function scanGmailMerchants(userId: string): Promise<string[]> {
-  const tokens = await getAccessToken(userId);
+export async function scanGmailMerchants(
+  userId: string,
+  tokensOverride?: GmailAccessTokenResult | null
+): Promise<string[]> {
+  const tokens = tokensOverride ?? (await getAccessToken(userId));
   if (!tokens) return [];
+  if (tokens.status && String(tokens.status).toLowerCase() === "reauth_required") {
+    return [];
+  }
+
   const { client } = tokens;
   const gmail = google.gmail({ version: "v1", auth: client });
 
@@ -146,90 +153,116 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
   const dateStr = `${since.getFullYear()}/${String(since.getMonth() + 1).padStart(2, "0")}/${String(
     since.getDate()
   ).padStart(2, "0")}`;
-  const q = `subject:(receipt OR order OR invoice OR purchase OR bill OR transaction OR payment OR confirmation OR statement OR "your order" OR "receipt for") (category:updates OR label:purchases) after:${dateStr}`;
-  const keywordRegex = /\b(receipt(?:\s+for)?|your\s+order|invoice|purchase|bill|transaction|payment|confirmation|statement|order)\b/i;
-
-  const merchants = new Set<string>();
-  let pageToken: string | undefined;
-  let totalScanned = 0;
-  let qualifying = 0;
+  const subjectQuery =
+    'subject:(receipt OR order OR invoice OR purchase OR bill OR transaction OR payment OR confirmation OR statement OR "your order" OR "receipt for")';
+  const discoveryQueries = {
+    primary: [
+      subjectQuery,
+      "(label:^smartlabel_receipt OR category:updates)",
+      `after:${dateStr}`,
+    ].join(" "),
+    fallback: [subjectQuery, "category:updates", `after:${dateStr}`].join(" "),
+  };
+  const keywordRegex =
+    /\b(receipt(?:\s+for)?|your\s+order|invoice|purchase|bill|transaction|payment|confirmation|statement|order)\b/i;
 
   const MAX_QUALIFYING = 100;
   const MAX_SCANNED = 500;
 
-  while (totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING) {
-    const res = await withRetry(
-      () =>
-        gmail.users.messages.list({
-          userId: "me",
-          labelIds: ["INBOX"],
-          q,
-          maxResults: Math.min(MAX_SCANNED - totalScanned, 500),
-          pageToken,
-        }),
-      "users.messages.list"
-    );
+  async function collectMerchantsForQuery(query: string) {
+    const merchantsForQuery = new Set<string>();
+    let pageToken: string | undefined;
+    let totalScanned = 0;
+    let qualifying = 0;
+    let messageCount = 0;
 
-    const messages = res.data.messages || [];
-    if (messages.length === 0) break;
-
-    // Collect all message IDs for this page
-    const ids = messages.map((m) => m.id).filter((id): id is string => !!id);
-    const BATCH_SIZE = 10; // limit concurrent Gmail requests
-
-    for (
-      let i = 0,
-      len = ids.length;
-      i < len && totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING;
-      i += BATCH_SIZE
-    ) {
-      const batchIds = ids.slice(i, i + BATCH_SIZE);
-      const metas = await Promise.all(
-        batchIds.map((id) =>
-          withRetry(
-            () =>
-              gmail.users.messages.get({
-                userId: "me",
-                id,
-                format: "metadata",
-                metadataHeaders: ["From", "Subject"],
-              }),
-            "users.messages.get"
-          ).catch(() => null)
-        )
+    while (totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING) {
+      const res = await withRetry(
+        () =>
+          gmail.users.messages.list({
+            userId: "me",
+            labelIds: ["INBOX"],
+            q: query,
+            maxResults: Math.min(MAX_SCANNED - totalScanned, 500),
+            pageToken,
+          }),
+        "users.messages.list"
       );
 
-      for (const meta of metas) {
-        if (!meta) continue;
-        const headers = meta.data.payload?.headers || [];
-        const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
-        const subject = headers
-          .find((h: any) => (h.name || "").toLowerCase() === "subject")
-          ?.value;
-        totalScanned++;
-        if (!from || !subject || !keywordRegex.test(subject)) continue;
-        qualifying++;
-        const domain = extractDomain(from);
-        const display = extractDisplayName(from);
-        if (domain && /amazon\./i.test(domain)) continue;
-        let merchant = domain;
-        if (!merchant || isGenericDomain(merchant)) {
-          merchant = display || extractMerchantFromSubject(subject);
+      const messages = res.data.messages || [];
+      if (messages.length === 0) break;
+      messageCount += messages.length;
+
+      const ids = messages.map((m) => m.id).filter((id): id is string => !!id);
+      const BATCH_SIZE = 10;
+
+      for (
+        let i = 0,
+          len = ids.length;
+        i < len && totalScanned < MAX_SCANNED && qualifying < MAX_QUALIFYING;
+        i += BATCH_SIZE
+      ) {
+        const batchIds = ids.slice(i, i + BATCH_SIZE);
+        const metas = await Promise.all(
+          batchIds.map((id) =>
+            withRetry(
+              () =>
+                gmail.users.messages.get({
+                  userId: "me",
+                  id,
+                  format: "metadata",
+                  metadataHeaders: ["From", "Subject"],
+                }),
+              "users.messages.get"
+            ).catch(() => null)
+          )
+        );
+
+        for (const meta of metas) {
+          if (!meta) continue;
+          const headers = meta.data.payload?.headers || [];
+          const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value;
+          const subject = headers
+            .find((h: any) => (h.name || "").toLowerCase() === "subject")
+            ?.value;
+          totalScanned++;
+          if (!from || !subject || !keywordRegex.test(subject)) continue;
+          qualifying++;
+          const domain = extractDomain(from);
+          const display = extractDisplayName(from);
+          if (domain && /amazon\./i.test(domain)) continue;
+          let merchant = domain;
+          if (!merchant || isGenericDomain(merchant)) {
+            merchant = display || extractMerchantFromSubject(subject);
+          }
+          if (merchant) {
+            merchantsForQuery.add(normalizeMerchant(merchant));
+          }
+          if (totalScanned >= MAX_SCANNED || qualifying >= MAX_QUALIFYING) break;
         }
-        if (merchant) {
-          merchants.add(normalizeMerchant(merchant));
-        }
-        if (totalScanned >= MAX_SCANNED || qualifying >= MAX_QUALIFYING) break;
       }
+
+      if (
+        totalScanned >= MAX_SCANNED ||
+        qualifying >= MAX_QUALIFYING ||
+        !res.data.nextPageToken
+      ) {
+        break;
+      }
+      pageToken = res.data.nextPageToken;
     }
 
-    if (
-      totalScanned >= MAX_SCANNED ||
-      qualifying >= MAX_QUALIFYING ||
-      !res.data.nextPageToken
-    )
-      break;
-    pageToken = res.data.nextPageToken;
+    return { merchants: merchantsForQuery, messageCount };
+  }
+
+  const primaryResult = await collectMerchantsForQuery(discoveryQueries.primary);
+  const merchants = new Set(primaryResult.merchants);
+
+  if (primaryResult.messageCount === 0) {
+    const fallbackResult = await collectMerchantsForQuery(discoveryQueries.fallback);
+    for (const merchant of fallbackResult.merchants) {
+      merchants.add(merchant);
+    }
   }
 
   return Array.from(merchants);
