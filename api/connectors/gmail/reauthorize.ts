@@ -1,4 +1,7 @@
 // api/connectors/gmail/reauthorize.ts
+// Assumes we can flag reauth without discarding refresh tokens; trade-off keeps the old
+// token in storage temporarily so Google reauth callbacks can reuse it if a new token is
+// not returned, while status gating still blocks usage until reauth finishes.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { getGmailAuthUrl } from "../../../lib/gmail.js";
 import { supabaseAdmin } from "../../../lib/supabase-admin.js";
@@ -36,19 +39,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ ok: false, error: "missing user" });
     }
 
-    await supabaseAdmin
+    const { data: existingRow, error: fetchError } = await supabaseAdmin
       .from("gmail_tokens")
-      .upsert(
-        {
-          user_id: user,
-          refresh_token: null,
+      .select("user_id")
+      .eq("user_id", user)
+      .maybeSingle();
+    if (fetchError) {
+      throw fetchError;
+    }
+
+    if (existingRow) {
+      const { error: updateError } = await supabaseAdmin
+        .from("gmail_tokens")
+        .update({
+          status: "reauth_required",
           access_token: null,
           access_token_expires_at: null,
-          granted_scopes: [],
-          status: "reauth_required",
-        },
-        { onConflict: "user_id" }
-      );
+        })
+        .eq("user_id", user);
+      if (updateError) {
+        throw updateError;
+      }
+    } else {
+      const { error: insertError } = await supabaseAdmin
+        .from("gmail_tokens")
+        .upsert(
+          {
+            user_id: user,
+            refresh_token: null,
+            access_token: null,
+            access_token_expires_at: null,
+            granted_scopes: [],
+            status: "reauth_required",
+          },
+          { onConflict: "user_id" }
+        );
+      if (insertError) {
+        throw insertError;
+      }
+    }
 
     const state = Buffer.from(JSON.stringify({ user }), "utf8").toString("base64url");
     const url = getGmailAuthUrl(state);
