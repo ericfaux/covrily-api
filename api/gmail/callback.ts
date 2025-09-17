@@ -1,4 +1,5 @@
 // api/gmail/callback.ts
+// Assumes Supabase already stores prior refresh tokens; trade-off is an extra read when Google omits a refresh token so we do not break reauth'd users.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createOAuthClient, exchangeCodeForTokens } from "../../lib/gmail.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
@@ -18,11 +19,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     if (!user) throw new Error("missing user");
 
+    const maskedUser =
+      user.length > 8 ? `${user.slice(0, 4)}…${user.slice(-2)}` : user || "unknown";
+
     const tokens = await exchangeCodeForTokens(code);
     const expires = tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : null;
 
     const client = createOAuthClient();
-    client.setCredentials(tokens);
+
+    // Preserve an existing refresh token if Google does not return one on this callback.
+    let refreshToken = tokens.refresh_token || null;
+    if (!refreshToken) {
+      const { data: existingTokenRow, error: existingTokenError } = await supabaseAdmin
+        .from("gmail_tokens")
+        .select("refresh_token")
+        .eq("user_id", user)
+        .maybeSingle();
+      if (existingTokenError) {
+        console.error("[gmail] failed to load existing refresh token", {
+          error: existingTokenError,
+          user: maskedUser,
+        });
+      }
+      if (existingTokenRow?.refresh_token) {
+        refreshToken = existingTokenRow.refresh_token as string;
+      }
+    }
+
+    if (!refreshToken) {
+      // Without a refresh token we cannot sustain access, so fail fast and surface an error to the UI.
+      throw new Error("missing refresh token");
+    }
+
+    client.setCredentials({ ...tokens, refresh_token: refreshToken });
 
     let grantedScopes: string[] = [];
     if (tokens.access_token) {
@@ -50,7 +79,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .upsert(
         {
           user_id: user,
-          refresh_token: tokens.refresh_token,
+          refresh_token: refreshToken,
           access_token: tokens.access_token,
           access_token_expires_at: expires,
           granted_scopes: grantedScopes,
@@ -60,8 +89,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
 
     if (grantedScopes.length > 0) {
-      const maskedUser =
-        user.length > 8 ? `${user.slice(0, 4)}…${user.slice(-2)}` : user || "unknown";
       console.info("[gmail] linked user scopes", {
         user: maskedUser,
         scopes: grantedScopes,
