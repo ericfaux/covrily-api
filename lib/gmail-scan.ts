@@ -135,9 +135,16 @@ function isGenericDomain(domain: string): boolean {
   return GENERIC_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`));
 }
 
-export async function scanGmailMerchants(userId: string): Promise<string[]> {
-  const tokens = await getAccessToken(userId);
+export async function scanGmailMerchants(
+  userId: string,
+  tokensOverride?: GmailAccessTokenResult | null
+): Promise<string[]> {
+  const tokens = tokensOverride ?? (await getAccessToken(userId));
   if (!tokens) return [];
+  if (tokens.status && String(tokens.status).toLowerCase() === "reauth_required") {
+    return [];
+  }
+
   const { client } = tokens;
   const gmail = google.gmail({ version: "v1", auth: client });
 
@@ -146,8 +153,13 @@ export async function scanGmailMerchants(userId: string): Promise<string[]> {
   const dateStr = `${since.getFullYear()}/${String(since.getMonth() + 1).padStart(2, "0")}/${String(
     since.getDate()
   ).padStart(2, "0")}`;
-  const q = `subject:(receipt OR order OR invoice OR purchase OR bill OR transaction OR payment OR confirmation OR statement OR "your order" OR "receipt for") (category:updates OR label:purchases) after:${dateStr}`;
-  const keywordRegex = /\b(receipt(?:\s+for)?|your\s+order|invoice|purchase|bill|transaction|payment|confirmation|statement|order)\b/i;
+  const q = [
+    'subject:(receipt OR order OR invoice OR purchase OR bill OR transaction OR payment OR confirmation OR statement OR "your order" OR "receipt for")',
+    "(category:updates OR label:purchases)",
+    `after:${dateStr}`,
+  ].join(" ");
+  const keywordRegex =
+    /\b(receipt(?:\s+for)?|your\s+order|invoice|purchase|bill|transaction|payment|confirmation|statement|order)\b/i;
 
   const merchants = new Set<string>();
   let pageToken: string | undefined;
