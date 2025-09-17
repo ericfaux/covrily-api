@@ -3,6 +3,7 @@
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { google } from "googleapis";
+import { createHash } from "crypto";
 import parsePdf from "../../lib/pdf.js";
 import { naiveParse, type ParsedReceipt } from "../../lib/parse.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
@@ -38,6 +39,424 @@ const REQUIRED_WRITE_SCOPES = [
 
 const LABELING_ENABLED =
   (process.env.GMAIL_LABELING_ENABLED || "").toLowerCase() === "true";
+
+const BASE_SUBJECT_QUERY =
+  'subject:(receipt OR "receipt for" OR order OR "your order" OR invoice OR purchase OR bill OR transaction OR payment OR confirmation OR statement)';
+const SMARTLABEL_CLAUSE = "(label:^smartlabel_receipt OR category:updates)";
+const UPDATES_CLAUSE = "category:updates";
+const DEFAULT_INGEST_MONTHS = 6;
+const PRIMARY_RESULT_THRESHOLD = 3;
+const MAX_MESSAGES_PER_QUERY = 500;
+
+const MERCHANT_DOMAIN_CATALOG: Record<string, string[]> = {
+  amazon: ["amazon.com", "amazon.ca", "amazon.co.uk"],
+  "amazon.com": ["amazon.com", "amazon.ca", "amazon.co.uk"],
+  "amazon.ca": ["amazon.ca"],
+  "amazon.co.uk": ["amazon.co.uk"],
+  "best buy": ["bestbuy.com", "bestbuy.ca"],
+  bestbuy: ["bestbuy.com", "bestbuy.ca"],
+  "bestbuy.com": ["bestbuy.com", "bestbuy.ca"],
+  "bestbuy.ca": ["bestbuy.ca"],
+  walmart: ["walmart.com", "walmart.ca"],
+  "walmart.com": ["walmart.com", "walmart.ca"],
+  "walmart.ca": ["walmart.ca"],
+  target: ["target.com"],
+  "target.com": ["target.com"],
+  "home depot": ["homedepot.com"],
+  homedepot: ["homedepot.com"],
+  "homedepot.com": ["homedepot.com"],
+  lowes: ["lowes.com"],
+  "lowes.com": ["lowes.com"],
+  costco: ["costco.com"],
+  "costco.com": ["costco.com"],
+  apple: ["apple.com"],
+  "apple.com": ["apple.com"],
+  paypal: ["paypal.com"],
+  "paypal.com": ["paypal.com"],
+  shopify: ["shopify.com"],
+  "shopify.com": ["shopify.com"],
+  square: ["squareup.com"],
+  "squareup.com": ["squareup.com"],
+  etsy: ["etsy.com"],
+  "etsy.com": ["etsy.com"],
+  "best buy canada": ["bestbuy.ca"],
+};
+
+function computeSinceDate(raw?: string | number | null): string {
+  const parsed = Number.parseInt(String(raw ?? ""), 10);
+  const months = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_INGEST_MONTHS;
+  const since = new Date();
+  since.setMonth(since.getMonth() - months);
+  const yyyy = since.getFullYear();
+  const mm = String(since.getMonth() + 1).padStart(2, "0");
+  const dd = String(since.getDate()).padStart(2, "0");
+  return `${yyyy}/${mm}/${dd}`;
+}
+
+function sanitizeKey(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9.@ ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getMerchantDomains(raw: string): string[] {
+  const domains = new Set<string>();
+  const normalized = sanitizeKey(raw);
+  if (!normalized) return [];
+
+  const maybeAdd = (domain?: string | null) => {
+    if (!domain) return;
+    const cleaned = domain.replace(/^@/, "").trim().toLowerCase();
+    if (cleaned) domains.add(cleaned);
+  };
+
+  if (normalized.includes("@")) {
+    const domain = normalized.split("@").pop();
+    maybeAdd(domain);
+  }
+
+  if (normalized.includes(".")) {
+    maybeAdd(normalized);
+  }
+
+  const aliasKey = normalized.replace(/\./g, " ");
+  for (const key of [normalized, aliasKey, aliasKey.replace(/\s+/g, " ")]) {
+    const mapped = MERCHANT_DOMAIN_CATALOG[key];
+    if (mapped) {
+      for (const domain of mapped) maybeAdd(domain);
+    }
+  }
+
+  if (domains.size === 0) {
+    const fallback = normalized.replace(/\s+/g, "");
+    if (fallback) {
+      maybeAdd(`${fallback}.com`);
+    }
+  }
+
+  return Array.from(domains);
+}
+
+function buildFromTokens(merchant: string, domains: string[]): string[] {
+  const tokens = new Set<string>();
+  for (const domain of domains) {
+    if (!domain) continue;
+    tokens.add(`@${domain}`);
+  }
+  const cleaned = merchant.replace(/["']/g, "").trim();
+  if (cleaned) {
+    tokens.add(`"${cleaned}"`);
+  }
+  return Array.from(tokens);
+}
+
+async function searchMessageIds(
+  gmail: any,
+  query: string,
+  limit = MAX_MESSAGES_PER_QUERY
+): Promise<string[]> {
+  const ids: string[] = [];
+  let pageToken: string | undefined;
+  do {
+    const remaining = limit - ids.length;
+    if (remaining <= 0) break;
+    const resp: any = await withRetry(
+      () =>
+        gmail.users.messages.list(
+          {
+            userId: "me",
+            q: query,
+            maxResults: Math.min(remaining, 500),
+            pageToken,
+            format: "metadata",
+            metadataHeaders: ["From", "Subject"],
+          } as any
+        ),
+      "users.messages.list"
+    );
+    const messages = (resp?.data?.messages as any[]) || [];
+    for (const msg of messages) {
+      if (msg.id) ids.push(msg.id);
+    }
+    pageToken = resp?.data?.nextPageToken || undefined;
+  } while (pageToken && ids.length < limit);
+  return ids;
+}
+
+type ParseSourceType = "rules" | "llm";
+
+interface NormalizedLineItem {
+  sku?: string | null;
+  name: string;
+  qty: number;
+  unit_price: number | null;
+  unit_cents: number | null;
+}
+
+interface BuildReceiptParams {
+  userId: string;
+  merchantValue: string | null;
+  fallbackMerchant: string;
+  orderId: string | null;
+  purchaseDate: string | null;
+  totalCents: any;
+  taxCents: any;
+  shippingCents: any;
+  currency: string | null;
+  items: any[];
+  emailMessageId: string;
+  parseSource: ParseSourceType;
+  receiptLink: string | null;
+  gmail: any;
+}
+
+interface NormalizedReceiptInsert {
+  merchant: string;
+  order_id: string;
+  purchase_date: string;
+  currency: string;
+  total_amount: number;
+  total_cents: number;
+  taxes: number | null;
+  tax_cents: number | null;
+  shipping: number | null;
+  shipping_cents: number | null;
+  line_items: NormalizedLineItem[];
+  email_message_id: string;
+  parse_source: ParseSourceType;
+  confidence: number;
+  receipt_url: string | null;
+  dedupe_key: string;
+  raw_json: any;
+}
+
+function capitalizeWords(value: string): string {
+  return value
+    .split(/\s+/)
+    .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : ""))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function formatMerchantName(raw: string | null, fallback: string): string | null {
+  const base = (raw || fallback || "").trim();
+  if (!base) return null;
+  let candidate = base.replace(/["']/g, "");
+  const atIndex = candidate.lastIndexOf("@");
+  if (atIndex >= 0) {
+    candidate = candidate.slice(atIndex + 1);
+  }
+  if (candidate.includes("<")) {
+    candidate = candidate.split("<")[0].trim();
+  }
+  if (candidate.includes("(")) {
+    candidate = candidate.replace(/\([^)]*\)/g, "").trim();
+  }
+  if (candidate.includes(".")) {
+    const domainPart = candidate.split("@").pop() || candidate;
+    candidate = domainPart.split(".")[0];
+  }
+  candidate = candidate.replace(/[-_]/g, " ").trim();
+  if (!candidate) return null;
+  return capitalizeWords(candidate);
+}
+
+function normalizeDate(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function parsePriceValue(value: any): number | null {
+  if (value == null) return null;
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === "string") {
+    const cleaned = value.replace(/[^0-9.,-]/g, "");
+    if (!cleaned) return null;
+    const numeric = Number.parseFloat(cleaned);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+  return null;
+}
+
+function normalizeCents(value: any): number | null {
+  if (value == null) return null;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    return Math.round(value);
+  }
+  if (typeof value === "string") {
+    const cleaned = value.replace(/[^0-9.,-]/g, "");
+    if (!cleaned) return null;
+    const numeric = Number.parseFloat(cleaned);
+    if (!Number.isFinite(numeric)) return null;
+    if (cleaned.includes(".")) {
+      return Math.round(numeric * 100);
+    }
+    return Math.round(numeric);
+  }
+  return null;
+}
+
+function convertLineItems(items: any[]): NormalizedLineItem[] {
+  return items
+    .map((item) => {
+      if (!item) return null;
+      const name = (item.name || "").toString().trim();
+      const sku = item.sku ?? item.id ?? null;
+      let qty = Number(item.qty ?? 1);
+      if (!Number.isFinite(qty) || qty <= 0) qty = 1;
+      qty = Math.round(qty);
+
+      const price = parsePriceValue(item.unit_price);
+      let unitCents = normalizeCents(item.unit_cents);
+      let unitPrice = price;
+      if (unitPrice == null && unitCents != null) {
+        unitPrice = unitCents / 100;
+      } else if (unitPrice != null && unitCents == null) {
+        unitCents = Math.round(unitPrice * 100);
+      }
+
+      if (!name && unitPrice == null && unitCents == null) {
+        return null;
+      }
+
+      return {
+        sku: sku ? String(sku) : null,
+        name: name || "Item",
+        qty,
+        unit_price: unitPrice != null ? Number(unitPrice.toFixed(2)) : null,
+        unit_cents: unitCents != null ? unitCents : null,
+      } as NormalizedLineItem;
+    })
+    .filter((item): item is NormalizedLineItem => !!item);
+}
+
+function computeConfidence(input: {
+  hasMerchant: boolean;
+  hasOrderId: boolean;
+  hasPurchaseDate: boolean;
+  hasTotal: boolean;
+  hasTax: boolean;
+  hasShipping: boolean;
+  hasItems: boolean;
+  parseSource: ParseSourceType;
+}): number {
+  let score = 0;
+  if (input.hasMerchant) score += 1;
+  if (input.hasOrderId) score += 1;
+  if (input.hasPurchaseDate) score += 1;
+  if (input.hasTotal) score += 1;
+  if (input.hasTax) score += 0.5;
+  if (input.hasShipping) score += 0.5;
+  if (input.hasItems) score += 0.5;
+  let confidence = score / 4;
+  if (input.parseSource === "rules" && confidence < 1) {
+    confidence = Math.min(1, confidence + 0.1);
+  }
+  if (input.parseSource === "llm") {
+    confidence = Math.min(confidence, 0.8);
+  }
+  confidence = Math.max(0.1, Math.min(1, confidence));
+  return Number(confidence.toFixed(2));
+}
+
+function buildNormalizedReceipt(
+  params: BuildReceiptParams
+): NormalizedReceiptInsert | null {
+  const merchantName = formatMerchantName(
+    params.merchantValue,
+    params.fallbackMerchant
+  );
+  const orderIdRaw = (params.orderId || "").toString().trim();
+  const purchaseDateIso = normalizeDate(params.purchaseDate);
+  const totalCents = normalizeCents(params.totalCents);
+  const taxCents = normalizeCents(params.taxCents);
+  const shippingCents = normalizeCents(params.shippingCents);
+  const currency = (params.currency || "USD")
+    .toString()
+    .trim()
+    .toUpperCase() || "USD";
+  const lineItems = convertLineItems(params.items);
+
+  if (!merchantName || !orderIdRaw || !purchaseDateIso || totalCents == null) {
+    return null;
+  }
+
+  const totalAmount = Number((totalCents / 100).toFixed(2));
+  const taxes = taxCents != null ? Number((taxCents / 100).toFixed(2)) : null;
+  const shipping =
+    shippingCents != null ? Number((shippingCents / 100).toFixed(2)) : null;
+
+  const confidence = computeConfidence({
+    hasMerchant: !!merchantName,
+    hasOrderId: !!orderIdRaw,
+    hasPurchaseDate: !!purchaseDateIso,
+    hasTotal: totalCents != null,
+    hasTax: taxCents != null,
+    hasShipping: shippingCents != null,
+    hasItems: lineItems.length > 0,
+    parseSource: params.parseSource,
+  });
+
+  const merchantKey = merchantName.toLowerCase();
+  const orderKey = orderIdRaw.toLowerCase();
+  const dedupeKey = createHash("sha256")
+    .update(
+      `${params.userId}|${merchantKey}|${orderKey}|${purchaseDateIso}|${totalAmount.toFixed(
+        2
+      )}`
+    )
+    .digest("hex");
+
+  const raw_json = {
+    gmail: params.gmail,
+    normalized: {
+      merchant: merchantName,
+      order_id: orderIdRaw,
+      purchase_date: purchaseDateIso,
+      currency,
+      total_amount: totalAmount,
+      taxes,
+      shipping,
+      line_items: lineItems.map((item) => ({
+        sku: item.sku ?? null,
+        name: item.name,
+        qty: item.qty,
+        unit_price: item.unit_price,
+      })),
+      email_message_id: params.emailMessageId,
+      parse_source: params.parseSource,
+      confidence,
+      receipt_url: params.receiptLink,
+    },
+  };
+
+  return {
+    merchant: merchantName,
+    order_id: orderIdRaw,
+    purchase_date: purchaseDateIso,
+    currency,
+    total_amount: totalAmount,
+    total_cents: totalCents,
+    taxes,
+    tax_cents: taxCents,
+    shipping,
+    shipping_cents: shippingCents,
+    line_items: lineItems,
+    email_message_id: params.emailMessageId,
+    parse_source: params.parseSource,
+    confidence,
+    receipt_url: params.receiptLink,
+    dedupe_key: dedupeKey,
+    raw_json,
+  };
+}
 
 class GmailReauthRequiredError extends Error {
   public readonly statusCode = 428;
@@ -525,9 +944,10 @@ async function processMessage(
   merchant: string,
   messageId: string,
   processedLabelId?: string | null
-): Promise<void> {
+): Promise<boolean> {
   let shouldLabel = false;
   let markRead = false;
+  let created = false;
   let full;
   try {
     full = await withRetry(
@@ -541,15 +961,17 @@ async function processMessage(
     );
   } catch (err) {
     maybeThrowReauth(err, gmail);
-    return;
+    return false;
   }
 
   try {
     const payload = full.data.payload || {};
     const headers = payload.headers || [];
-    const subject = headers.find((h: any) => (h.name || "").toLowerCase() === "subject")?.value || "";
-    const from = headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value || "";
-  
+    const subject =
+      headers.find((h: any) => (h.name || "").toLowerCase() === "subject")?.value || "";
+    const from =
+      headers.find((h: any) => (h.name || "").toLowerCase() === "from")?.value || "";
+
     const text = extractText(payload);
     const combined = `${subject}\n${text}`;
     const heuristicHit = hasReceiptIndicators(combined);
@@ -558,14 +980,15 @@ async function processMessage(
       isReceipt = await isReceiptLLM(combined);
     }
     if (!isReceipt) {
-      shouldLabel = true;
-      return;
+      shouldLabel = LABELING_ENABLED;
+      return false;
     }
-    shouldLabel = true;
+
+    shouldLabel = LABELING_ENABLED;
     markRead = true;
     let parsed: ParsedReceipt | null = null;
     let fromPdf = false;
-  
+
     const pdfPart = findPdfPart(payload);
     if (pdfPart) {
       let buf: Buffer | null = null;
@@ -590,141 +1013,198 @@ async function processMessage(
         fromPdf = true;
       }
     }
-  
+
     if (!parsed) {
       parsed = naiveParse(combined, from);
     }
-  
+
     let receiptLink: string | null = null;
-  
-    let {
-      merchant: m,
-      order_id,
-      purchase_date,
-      total_cents,
-      tax_cents,
-      shipping_cents,
-    } = parsed as any;
-  
-    let needsReceipt =
-      !m ||
-      m === "unknown" ||
-      !order_id ||
-      !purchase_date ||
-      total_cents == null ||
-      tax_cents == null ||
-      shipping_cents == null;
-  
-    if (needsReceipt) {
+    let merchantValue = (parsed as any)?.merchant ?? null;
+    let orderId = (parsed as any)?.order_id ?? null;
+    let purchaseDateRaw = (parsed as any)?.purchase_date ?? null;
+    let totalCents = (parsed as any)?.total_cents ?? null;
+    let taxCents = (parsed as any)?.tax_cents ?? null;
+    let shippingCents = (parsed as any)?.shipping_cents ?? null;
+    let currency = (parsed as any)?.currency ?? null;
+    let items: any[] = Array.isArray((parsed as any)?.items)
+      ? [...((parsed as any).items as any[])]
+      : [];
+
+    const essentialsMissing = () =>
+      !merchantValue ||
+      merchantValue === "unknown" ||
+      !orderId ||
+      !purchaseDateRaw ||
+      totalCents == null;
+
+    if (essentialsMissing()) {
       receiptLink = await findReceiptLink(payload, from);
       if (receiptLink) {
         (full.data as any).receipt_link = receiptLink;
         const linkParsed = await fetchReceiptFromLink(receiptLink, {
           user_id: userId,
           message_id: messageId,
-          merchant: m || merchant,
+          merchant: merchantValue || merchant,
           subject,
           from,
         });
         if (linkParsed) {
-          if ((!m || m === "unknown") && linkParsed.merchant) {
-            m = linkParsed.merchant.toLowerCase();
-            if (!(parsed as any).merchant) (parsed as any).merchant = linkParsed.merchant;
+          if ((!merchantValue || merchantValue === "unknown") && linkParsed.merchant) {
+            merchantValue = linkParsed.merchant;
+            (parsed as any).merchant = linkParsed.merchant;
           }
-          if (!order_id && linkParsed.order_id) {
-            order_id = linkParsed.order_id;
-            if (!(parsed as any).order_id) (parsed as any).order_id = linkParsed.order_id;
+          if (!orderId && linkParsed.order_id) {
+            orderId = linkParsed.order_id;
+            (parsed as any).order_id = linkParsed.order_id;
           }
-          if (!purchase_date && linkParsed.purchase_date) {
-            purchase_date = linkParsed.purchase_date;
-            if (!(parsed as any).purchase_date)
-              (parsed as any).purchase_date = linkParsed.purchase_date;
+          if (!purchaseDateRaw && linkParsed.purchase_date) {
+            purchaseDateRaw = linkParsed.purchase_date;
+            (parsed as any).purchase_date = linkParsed.purchase_date;
           }
-          if (total_cents == null && linkParsed.total_cents != null) {
-            total_cents = linkParsed.total_cents;
-            if ((parsed as any).total_cents == null)
-              (parsed as any).total_cents = linkParsed.total_cents;
+          if (totalCents == null && linkParsed.total_cents != null) {
+            totalCents = linkParsed.total_cents;
+            (parsed as any).total_cents = linkParsed.total_cents;
           }
-          if (tax_cents == null && (linkParsed as any).tax_cents != null) {
-            tax_cents = (linkParsed as any).tax_cents;
-            if ((parsed as any).tax_cents == null)
-              (parsed as any).tax_cents = (linkParsed as any).tax_cents;
+          if (taxCents == null && (linkParsed as any).tax_cents != null) {
+            taxCents = (linkParsed as any).tax_cents;
+            (parsed as any).tax_cents = (linkParsed as any).tax_cents;
           }
-          if (shipping_cents == null && (linkParsed as any).shipping_cents != null) {
-            shipping_cents = (linkParsed as any).shipping_cents;
-            if ((parsed as any).shipping_cents == null)
-              (parsed as any).shipping_cents = (linkParsed as any).shipping_cents;
+          if (shippingCents == null && (linkParsed as any).shipping_cents != null) {
+            shippingCents = (linkParsed as any).shipping_cents;
+            (parsed as any).shipping_cents = (linkParsed as any).shipping_cents;
           }
-          if (!(parsed as any).items && (linkParsed as any).items)
-            (parsed as any).items = (linkParsed as any).items;
+          if (!currency && (linkParsed as any).currency) {
+            currency = (linkParsed as any).currency;
+          }
+          if (Array.isArray((linkParsed as any).items) && (linkParsed as any).items.length > 0) {
+            items = (linkParsed as any).items;
+            (parsed as any).items = items;
+          }
         }
       }
     }
-  
-    needsReceipt =
-      !m ||
-      m === "unknown" ||
-      !order_id ||
-      !purchase_date ||
-      total_cents == null ||
-      tax_cents == null ||
-      shipping_cents == null;
-  
-    if (needsReceipt) {
+
+    let usedLLM = false;
+    if (essentialsMissing()) {
       const excerpt = (parsed as any).text_excerpt;
       const llmText = [subject, combined, excerpt].filter(Boolean).join("\n\n");
       const llm = await extractReceipt(llmText);
       if (llm) {
-        if ((!m || m === "unknown") && llm.merchant) m = llm.merchant.toLowerCase();
-        if (!order_id && llm.order_id) order_id = llm.order_id;
-        if (!purchase_date && llm.purchase_date) purchase_date = llm.purchase_date;
-        if (total_cents == null && llm.total_cents != null) total_cents = llm.total_cents;
-        if (tax_cents == null && llm.tax_cents != null) tax_cents = llm.tax_cents;
-        if (shipping_cents == null && llm.shipping_cents != null)
-          shipping_cents = llm.shipping_cents;
+        usedLLM = true;
+        if ((!merchantValue || merchantValue === "unknown") && llm.merchant) {
+          merchantValue = llm.merchant;
+        }
+        if (!orderId && llm.order_id) orderId = llm.order_id;
+        if (!purchaseDateRaw && llm.purchase_date) purchaseDateRaw = llm.purchase_date;
+        if (totalCents == null && llm.total_cents != null) totalCents = llm.total_cents;
+        if (taxCents == null && llm.tax_cents != null) taxCents = llm.tax_cents;
+        if (shippingCents == null && llm.shipping_cents != null)
+          shippingCents = llm.shipping_cents;
+        if (!currency && (llm as any).currency) currency = (llm as any).currency;
+        if (Array.isArray((llm as any).items) && items.length === 0) {
+          items = (llm as any).items;
+        }
       }
     }
-  
+
+    const merchantForLog = merchantValue || merchant || "unknown";
     await logParseResult({
       parser: fromPdf ? "pdf" : "naive",
-      merchant: m || "unknown",
-      order_id_found: !!order_id,
-      purchase_date_found: !!purchase_date,
-      total_cents_found: total_cents != null,
+      merchant: merchantForLog,
+      order_id_found: !!orderId,
+      purchase_date_found: !!purchaseDateRaw,
+      total_cents_found: totalCents != null,
     });
-  
-    const up = await supabaseAdmin
+
+    const normalized = buildNormalizedReceipt({
+      userId,
+      merchantValue,
+      fallbackMerchant: merchant,
+      orderId,
+      purchaseDate: purchaseDateRaw,
+      totalCents,
+      taxCents,
+      shippingCents,
+      currency,
+      items,
+      emailMessageId: messageId,
+      parseSource: usedLLM ? "llm" : "rules",
+      receiptLink,
+      gmail: full.data,
+    });
+
+    if (!normalized) {
+      return false;
+    }
+
+    const existingQuery = await supabaseAdmin
+      .from("receipts")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("dedupe_key", normalized.dedupe_key)
+      .maybeSingle();
+    if (existingQuery.error) {
+      throw existingQuery.error;
+    }
+    const existingRow = existingQuery.data;
+
+    const upsertResult = await supabaseAdmin
       .from("receipts")
       .upsert(
         [
           {
             user_id: userId,
-            merchant: m || merchant,
-            order_id: order_id || "",
-            purchase_date: purchase_date || null,
-            total_cents: total_cents ?? null,
-            tax_cents: tax_cents ?? null,
-            shipping_cents: shipping_cents ?? null,
-            receipt_url: receiptLink,
-            raw_json: full.data,
+            merchant: normalized.merchant,
+            order_id: normalized.order_id,
+            purchase_date: normalized.purchase_date,
+            currency: normalized.currency,
+            total_cents: normalized.total_cents,
+            tax_cents: normalized.tax_cents,
+            shipping_cents: normalized.shipping_cents,
+            source: "gmail",
+            email_message_id: normalized.email_message_id,
+            parse_source: normalized.parse_source,
+            confidence: normalized.confidence,
+            receipt_url: normalized.receipt_url,
+            raw_json: normalized.raw_json,
+            dedupe_key: normalized.dedupe_key,
           },
         ],
-        { onConflict: "user_id,merchant,order_id,purchase_date" }
+        { onConflict: "dedupe_key" }
       )
       .select("id")
       .single();
-  
-    const receiptId = up.data?.id;
-    const items: any[] = (parsed as any).items || [];
-    if (receiptId && Array.isArray(items) && items.length > 0) {
-      const payloadItems = items.map((it) => ({
-        receipt_id: receiptId,
-        name: it.name || "",
-        qty: it.qty || 1,
-        unit_cents: it.unit_cents ?? null,
-      }));
+
+    const receiptId = upsertResult.data?.id || existingRow?.id || null;
+
+    if (receiptId) {
       await supabaseAdmin.from("line_items").delete().eq("receipt_id", receiptId);
-      await supabaseAdmin.from("line_items").insert(payloadItems);
+      if (normalized.line_items.length > 0) {
+        const payloadItems = normalized.line_items.map((item) => ({
+          receipt_id: receiptId,
+          name: item.name,
+          qty: item.qty,
+          unit_cents: item.unit_cents,
+          sku: item.sku ?? null,
+        }));
+        const insertItems = await supabaseAdmin
+          .from("line_items")
+          .insert(payloadItems);
+        if (insertItems.error && /column "sku"/i.test(insertItems.error.message || "")) {
+          const fallbackPayload = payloadItems.map(({ sku, ...rest }) => rest);
+          await supabaseAdmin.from("line_items").insert(fallbackPayload);
+        }
+      }
+    }
+
+    if (!existingRow && receiptId) {
+      console.info("[gmail][ingest]", {
+        event: "receipt_created",
+        user_id: userId,
+        merchant: normalized.merchant,
+        count: 1,
+      });
+      created = true;
     }
   } finally {
     await modifyMessageLabels(
@@ -735,6 +1215,7 @@ async function processMessage(
       shouldLabel
     );
   }
+  return created;
 }
 
 async function modifyMessageLabels(
@@ -790,10 +1271,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const processedLabelCache = new Map<string, string | null>();
+    const byUser = new Map<string, string[]>();
 
     for (const row of data) {
       const userId = row.user_id as string;
       const merchant = row.merchant as string;
+      if (!userId || !merchant) continue;
+      const list = byUser.get(userId);
+      if (list) {
+        list.push(merchant);
+      } else {
+        byUser.set(userId, [merchant]);
+      }
+    }
+
+    const dateStr = computeSinceDate(
+      process.env.GMAIL_INGEST_MONTHS || process.env.GMAIL_DISCOVERY_MONTHS
+    );
+
+    for (const [userId, merchantList] of byUser) {
       const tokens = await getAccessToken(userId);
       if (!tokens) continue;
 
@@ -812,31 +1308,63 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           processedLabelCache.set(userId, processedLabelId ?? null);
         }
 
-        const terms = [`from:${merchant}`];
-        if (processedLabelId) {
-          terms.push(`-label:${PROCESSED_LABEL_NAME}`);
-        }
-        const q = terms.join(" ");
-        let list: any;
-        try {
-          list = await withRetry(
-            () => gmail.users.messages.list({ userId: "me", q }),
-            "users.messages.list"
-          );
-        } catch (err) {
-          maybeThrowReauth(err, gmail);
-          throw err;
-        }
-        const msgs = list.data.messages || [];
-        for (const msg of msgs) {
-          if (!msg.id) continue;
-          try {
-            await processMessage(gmail, userId, merchant, msg.id, processedLabelId);
-          } catch (err) {
-            if (err instanceof GmailReauthRequiredError) {
-              err.userId = userId;
+        const uniqueMerchants = Array.from(new Set(merchantList));
+        console.info("[gmail][ingest]", {
+          event: "scan_started",
+          user_id: userId,
+          merchants: uniqueMerchants.length,
+        });
+
+        for (const merchant of uniqueMerchants) {
+          const domains = getMerchantDomains(merchant);
+          const fromTokens = buildFromTokens(merchant, domains);
+          if (fromTokens.length === 0) continue;
+
+          const fromClause = `from:(${fromTokens.join(" OR ")})`;
+          const primaryParts = [
+            fromClause,
+            SMARTLABEL_CLAUSE,
+            BASE_SUBJECT_QUERY,
+            `after:${dateStr}`,
+          ];
+          const fallbackParts = [
+            fromClause,
+            UPDATES_CLAUSE,
+            BASE_SUBJECT_QUERY,
+            `after:${dateStr}`,
+          ];
+          if (processedLabelId) {
+            primaryParts.push(`-label:${PROCESSED_LABEL_NAME}`);
+            fallbackParts.push(`-label:${PROCESSED_LABEL_NAME}`);
+          }
+
+          const qPrimary = primaryParts.join(" ");
+          const qFallback = fallbackParts.join(" ");
+
+          const primaryIds = await searchMessageIds(gmail, qPrimary);
+          const messageIdSet = new Set(primaryIds);
+          const messageIds = [...primaryIds];
+
+          if (primaryIds.length < PRIMARY_RESULT_THRESHOLD) {
+            const fallbackIds = await searchMessageIds(gmail, qFallback);
+            for (const id of fallbackIds) {
+              if (!messageIdSet.has(id)) {
+                messageIdSet.add(id);
+                messageIds.push(id);
+              }
             }
-            throw err;
+          }
+
+          for (const id of messageIds) {
+            if (!id) continue;
+            try {
+              await processMessage(gmail, userId, merchant, id, processedLabelId);
+            } catch (err) {
+              if (err instanceof GmailReauthRequiredError) {
+                err.userId = userId;
+              }
+              throw err;
+            }
           }
         }
       } catch (err) {
