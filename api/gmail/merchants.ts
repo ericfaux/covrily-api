@@ -1,8 +1,21 @@
 // api/gmail/merchants.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getAccessToken, scanGmailMerchants } from "../../lib/gmail-scan.js";
+import {
+  getAccessToken,
+  scanGmailMerchants,
+  type MerchantDiscoveryItem,
+} from "../../lib/gmail-scan.js";
 import { saveApprovedMerchants } from "../../lib/merchants.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
+
+function normalizeMerchantRecord(item: MerchantDiscoveryItem): MerchantDiscoveryItem {
+  return {
+    name: item.name,
+    domain: item.domain.toLowerCase(),
+    est_count: item.est_count,
+    source: item.source,
+  };
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -13,22 +26,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const tokens = await getAccessToken(user);
       const status = tokens?.status ? String(tokens.status).toLowerCase() : null;
       if (!tokens || !tokens.accessToken || status === "reauth_required") {
-        return res.status(428).json({ ok: false, error: "reauth_required" });
+        return res.status(428).json({
+          ok: false,
+          code: "reauth_required",
+        });
       }
 
-      const merchants = await scanGmailMerchants(user, tokens);
-      const uniqueMerchants = Array.from(new Set(merchants));
+      const { merchants } = await scanGmailMerchants(user, tokens);
 
-      // store scanned merchants in auth_merchants table for review
+      const normalized = merchants.map((item) => normalizeMerchantRecord(item));
+
       await supabaseAdmin.from("auth_merchants").delete().eq("user_id", user);
-      if (uniqueMerchants.length > 0) {
-        const payload = uniqueMerchants.map((m) => ({ user_id: user, merchant: m }));
+      if (normalized.length > 0) {
+        const payload = normalized.map((item) => ({
+          user_id: user,
+          merchant: item.domain,
+          est_count: item.est_count,
+          source: item.source,
+        }));
         await supabaseAdmin
           .from("auth_merchants")
           .upsert(payload, { onConflict: "user_id,merchant" });
       }
 
-      return res.status(200).json({ ok: true, merchants: uniqueMerchants });
+      return res.status(200).json({ ok: true, merchants: normalized });
     }
 
     if (req.method === "POST") {
