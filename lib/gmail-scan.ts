@@ -1,4 +1,6 @@
 // lib/gmail-scan.ts
+// Assumes Supabase stores Gmail OAuth tokens with a status column alongside legacy fields;
+// trade-off is additional reads to surface status but keeps ingestion safely gated.
 import { google } from "googleapis";
 import { getDomain } from "tldts";
 import { supabaseAdmin } from "./supabase-admin.js";

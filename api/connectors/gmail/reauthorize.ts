@@ -1,7 +1,9 @@
 // api/connectors/gmail/reauthorize.ts
 // Assumes we can flag reauth without discarding refresh tokens; trade-off keeps the old
 // token in storage temporarily so Google reauth callbacks can reuse it if a new token is
-// not returned, while status gating still blocks usage until reauth finishes.
+// not returned, while status gating still blocks usage until reauth finishes. We also
+// mirror the legacy reauth_required boolean so older checks remain stable while the new
+// status column drives behavior.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { getGmailAuthUrl } from "../../../lib/gmail.js";
 import { supabaseAdmin } from "../../../lib/supabase-admin.js";
@@ -53,6 +55,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .from("gmail_tokens")
         .update({
           status: "reauth_required",
+          reauth_required: true,
           access_token: null,
           access_token_expires_at: null,
         })
@@ -71,6 +74,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             access_token_expires_at: null,
             granted_scopes: [],
             status: "reauth_required",
+            reauth_required: true,
           },
           { onConflict: "user_id" }
         );
