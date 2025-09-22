@@ -157,6 +157,18 @@ CREATE TABLE public.approved_merchants (
   CONSTRAINT approved_merchants_pkey PRIMARY KEY (user_id, merchant)
 );
 
+CREATE TABLE public.gmail_tokens (
+  user_id uuid NOT NULL,
+  refresh_token text,
+  access_token text,
+  access_token_expires_at timestamp with time zone,
+  granted_scopes text[] DEFAULT '{}'::text[],
+  reauth_required boolean DEFAULT false,
+  status text DEFAULT 'active'::text,
+  CONSTRAINT gmail_tokens_pkey PRIMARY KEY (user_id),
+  CONSTRAINT gmail_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
+);
+
 CREATE TABLE public.pending_receipts (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   user_id uuid,

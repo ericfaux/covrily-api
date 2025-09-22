@@ -1,4 +1,6 @@
 // api/gmail/ingest.ts
+// Assumes Gmail tokens carry status plus a legacy boolean so we can block ingestion cleanly;
+// trade-off is performing extra Supabase writes when scopes fail so both flags stay synced.
 // Fetch Gmail messages for approved merchants and store receipts
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
@@ -1382,7 +1384,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         try {
           await supabaseAdmin
             .from("gmail_tokens")
-            .update({ status: "reauth_required", granted_scopes: err.grantedScopes })
+            .update({
+              status: "reauth_required",
+              reauth_required: true,
+              granted_scopes: err.grantedScopes,
+            })
             .eq("user_id", err.userId);
         } catch (updateErr) {
           console.error("[gmail] failed to flag reauth requirement", updateErr);
