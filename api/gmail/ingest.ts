@@ -2,7 +2,9 @@
 // Assumes Gmail tokens carry status plus a legacy boolean so we can block ingestion cleanly;
 // trade-off is performing extra Supabase writes when scopes fail so both flags stay synced while
 // insisting on approved merchant selections before scanning to honor consent, and we canonicalize
-// receipt identifiers before hashing so dedupe keys stay stable at the cost of extra normalization.
+// receipt identifiers before hashing so dedupe keys stay stable at the cost of extra normalization,
+// also trusting parser-provided source/confidence first so ingest telemetry matches parser truth
+// while backfilling gaps with heuristics when parsers omit metadata.
 // Fetch Gmail messages for approved merchants and store receipts
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
@@ -211,7 +213,7 @@ interface BuildReceiptParams {
   currency: string | null;
   items: any[];
   emailMessageId: string;
-  parseSource: ParseSourceType;
+  parseSource: ParseSourceType | null;
   receiptLink: string | null;
   gmail: any;
 }
@@ -229,8 +231,8 @@ interface NormalizedReceiptInsert {
   shipping_cents: number | null;
   line_items: NormalizedLineItem[];
   email_message_id: string;
-  parse_source: ParseSourceType;
-  confidence: number;
+  parse_source: ParseSourceType | null;
+  confidence: number | null;
   receipt_url: string | null;
   dedupe_key: string;
   raw_json: any;
@@ -434,7 +436,7 @@ function buildNormalizedReceipt(
         unit_price: item.unit_price,
       })),
       email_message_id: params.emailMessageId,
-      parse_source: params.parseSource,
+      parse_source: params.parseSource ?? null,
       confidence,
       receipt_url: params.receiptLink,
     },
@@ -453,7 +455,7 @@ function buildNormalizedReceipt(
     shipping_cents: shippingCents,
     line_items: lineItems,
     email_message_id: params.emailMessageId,
-    parse_source: params.parseSource,
+    parse_source: params.parseSource ?? null,
     confidence,
     receipt_url: params.receiptLink,
     dedupe_key: dedupeKey,
@@ -479,6 +481,22 @@ class GmailReauthRequiredError extends Error {
       )
     );
     this.grantedScopes = unique;
+  }
+}
+
+class ReceiptUpsertError extends Error {
+  public readonly statusCode = 500;
+  public readonly code = "receipts_upsert_failed";
+  public readonly userId: string;
+  public readonly dedupeKey: string;
+  public readonly originalError: unknown;
+
+  constructor(userId: string, dedupeKey: string, originalError: unknown) {
+    super("Receipt upsert failed");
+    this.name = "ReceiptUpsertError";
+    this.userId = userId;
+    this.dedupeKey = dedupeKey;
+    this.originalError = originalError;
   }
 }
 
@@ -1144,16 +1162,96 @@ async function processMessage(
       return false;
     }
 
+    // Prefer parser metadata but fall back to our heuristic classification so telemetry stays filled.
+    const fallbackParseSource: ParseSourceType = usedLLM ? "llm" : "rules";
+    const rawParseSource = (parsed as any)?.source;
+    const resolvedParseSource: ParseSourceType | null =
+      rawParseSource === "rules" || rawParseSource === "llm"
+        ? rawParseSource
+        : fallbackParseSource;
+    (parsed as any).source = resolvedParseSource;
+
+    const normalizedConfidence =
+      typeof normalized.confidence === "number" &&
+      Number.isFinite(normalized.confidence)
+        ? Number(normalized.confidence.toFixed(2))
+        : null;
+    const rawParsedConfidence = (parsed as any)?.confidence;
+    let resolvedConfidence: number | null = null;
+    if (
+      typeof rawParsedConfidence === "number" &&
+      Number.isFinite(rawParsedConfidence)
+    ) {
+      resolvedConfidence = Number(rawParsedConfidence.toFixed(2));
+    } else if (typeof rawParsedConfidence === "string") {
+      const parsedValue = Number.parseFloat(rawParsedConfidence);
+      if (Number.isFinite(parsedValue)) {
+        resolvedConfidence = Number(parsedValue.toFixed(2));
+      }
+    }
+    if (resolvedConfidence == null && normalizedConfidence != null) {
+      resolvedConfidence = normalizedConfidence;
+    }
+    (parsed as any).confidence = resolvedConfidence;
+
+    const row = {
+      user_id: userId,
+      merchant: normalized.merchant,
+      order_id: normalized.order_id || null,
+      purchase_date: normalized.purchase_date,
+      currency: normalized.currency || "USD",
+      total_amount: normalized.total_amount,
+      total_cents: normalized.total_cents,
+      tax_cents: normalized.tax_cents,
+      shipping_cents: normalized.shipping_cents,
+      source: "gmail",
+      email_message_id: normalized.email_message_id,
+      parse_source: resolvedParseSource,
+      confidence: resolvedConfidence,
+      receipt_url: normalized.receipt_url,
+      raw_json: normalized.raw_json,
+    } as {
+      user_id: string;
+      merchant: string;
+      order_id: string | null;
+      purchase_date: string;
+      currency: string;
+      total_amount: number;
+      total_cents: number;
+      tax_cents: number | null;
+      shipping_cents: number | null;
+      source: string;
+      email_message_id: string;
+      parse_source: ParseSourceType | null;
+      confidence: number | null;
+      receipt_url: string | null;
+      raw_json: any;
+      dedupe_key?: string;
+    };
+
+    row.dedupe_key = makeDedupeKey({
+      user_id: row.user_id,
+      merchant: row.merchant,
+      order_id: row.order_id,
+      purchase_date: row.purchase_date,
+      currency: row.currency || "USD",
+      total_amount: row.total_amount,
+    });
+
+    normalized.dedupe_key = row.dedupe_key;
+    normalized.parse_source = row.parse_source;
+    normalized.confidence = row.confidence;
+
     const existingQuery = await supabaseAdmin
       .from("receipts")
       .select("id")
       .eq("user_id", userId)
-      .eq("dedupe_key", normalized.dedupe_key)
+      .eq("dedupe_key", row.dedupe_key)
       .maybeSingle();
     if (existingQuery.error) {
       console.error("[receipts select]", {
-        user_id: userId,
-        dedupe_key: normalized.dedupe_key,
+        user_id: row.user_id,
+        dedupe_key: row.dedupe_key,
         error: existingQuery.error,
       });
       throw existingQuery.error;
@@ -1162,38 +1260,17 @@ async function processMessage(
 
     const upsertResult = await supabaseAdmin
       .from("receipts")
-      .upsert(
-        [
-          {
-            user_id: userId,
-            merchant: normalized.merchant,
-            order_id: normalized.order_id,
-            purchase_date: normalized.purchase_date,
-            currency: normalized.currency,
-            total_cents: normalized.total_cents,
-            tax_cents: normalized.tax_cents,
-            shipping_cents: normalized.shipping_cents,
-            source: "gmail",
-            email_message_id: normalized.email_message_id,
-            parse_source: normalized.parse_source,
-            confidence: normalized.confidence,
-            receipt_url: normalized.receipt_url,
-            raw_json: normalized.raw_json,
-            dedupe_key: normalized.dedupe_key,
-          },
-        ],
-        { onConflict: "user_id,dedupe_key" }
-      )
+      .upsert(row, { onConflict: "user_id,dedupe_key" })
       .select("id")
-      .single();
+      .maybeSingle();
 
     if (upsertResult.error) {
       console.error("[receipts upsert]", {
-        user_id: userId,
-        dedupe_key: normalized.dedupe_key,
+        user_id: row.user_id,
+        dedupe_key: row.dedupe_key,
         error: upsertResult.error,
       });
-      throw upsertResult.error;
+      throw new ReceiptUpsertError(row.user_id, row.dedupe_key, upsertResult.error);
     }
 
     const receiptId = upsertResult.data?.id || existingRow?.id || null;
@@ -1576,6 +1653,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         requiredScopes: err.requiredScopes,
         grantedScopes: err.grantedScopes,
       });
+    }
+    if (err instanceof ReceiptUpsertError) {
+      return res.status(err.statusCode).json({ ok: false, error: err.code });
     }
     console.error("[gmail] ingest failed", err);
     return res.status(500).json({ ok: false, error: "internal_error" });

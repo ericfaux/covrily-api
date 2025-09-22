@@ -1,6 +1,8 @@
 // api/gmail/merchants-ui.ts
 // Assumes merchant payloads provide stable ids and human-friendly names; trade-off is handling
-// legacy string responses in the client so the checkbox list stays usable during rollout.
+// legacy string responses in the client so the checkbox list stays usable during rollout, and we
+// now surface ingest failures by echoing the raw response text so troubleshooting is easier even
+// though the UI may show less-polished error strings.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -32,7 +34,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     <p>Choose the merchants whose receipts you'd like to import.</p>
     <div id="list"></div>
     <button id="save">Save</button>
-    <p id="status" role="status"></p>
+    <p id="msg" role="status"></p>
   </main>
   <script>
     const user = ${JSON.stringify(user)};
@@ -92,13 +94,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     document.getElementById('save').onclick = async () => {
       const button = document.getElementById('save');
-      const status = document.getElementById('status');
-      if (!(button instanceof HTMLButtonElement) || !(status instanceof HTMLElement)) {
+      const msgEl = document.getElementById('msg');
+      if (!(button instanceof HTMLButtonElement) || !(msgEl instanceof HTMLElement)) {
         return;
       }
       const selected = Array.from(document.querySelectorAll('#list input[type="checkbox"]:checked')).map(cb => cb.value);
       button.disabled = true;
-      status.textContent = 'Scanning…';
+      msgEl.textContent = 'Scanning…';
       try {
         const saveResp = await fetch('/api/gmail/merchants', {
           method: 'POST',
@@ -114,22 +116,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           body: JSON.stringify({ user })
         });
         if (!ingestResp.ok) {
-          let message = 'failed to scan';
+          let errText = '';
           try {
-            const payload = await ingestResp.json();
-            if (payload && typeof payload.error === 'string' && payload.error.length > 0) {
-              message = payload.error;
-            }
+            errText = await ingestResp.text();
           } catch (err) {
-            // ignore body parse errors; we only need a fallback message
+            errText = '';
           }
-          status.textContent = 'Scan failed: ' + message;
+          const message = errText && errText.trim().length > 0 ? errText.trim() : 'unknown error';
+          msgEl.textContent = 'Scan failed: ' + message;
           button.disabled = false;
           return;
         }
-        status.textContent = 'Scan complete! You can close this tab.';
+        msgEl.textContent = 'Scan complete! You can close this tab.';
       } catch (err) {
-        status.textContent = 'Failed to save selections.';
+        msgEl.textContent = 'Failed to save selections.';
         button.disabled = false;
       }
     };
