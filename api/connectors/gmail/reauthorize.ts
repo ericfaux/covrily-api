@@ -79,8 +79,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    const state = Buffer.from(JSON.stringify({ user }), "utf8").toString("base64url");
-    const url = getGmailAuthUrl(state);
+    const url = getGmailAuthUrl({ user });
+    // Rely on shared helper to keep OAuth state JSON encoded for consistent callback handling.
 
     return res.status(200).json({ ok: true, url });
   } catch (err) {
