@@ -1,12 +1,12 @@
 // api/gmail/ingest.ts
 // Assumes Gmail tokens carry status plus a legacy boolean so we can block ingestion cleanly;
 // trade-off is performing extra Supabase writes when scopes fail so both flags stay synced while
-// insisting on approved merchant selections before scanning to honor consent.
+// insisting on approved merchant selections before scanning to honor consent, and we canonicalize
+// receipt identifiers before hashing so dedupe keys stay stable at the cost of extra normalization.
 // Fetch Gmail messages for approved merchants and store receipts
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { google } from "googleapis";
-import { createHash } from "crypto";
 import parsePdf from "../../lib/pdf.js";
 import { naiveParse, type ParsedReceipt } from "../../lib/parse.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
@@ -18,6 +18,7 @@ import extractReceiptLink, {
   type ReceiptLinkCandidate,
 } from "../../lib/llm/extract-receipt-link.js";
 import { load } from "cheerio";
+import { makeDedupeKey } from "../../lib/receipt-dedupe.js";
 
 export const config = { runtime: "nodejs" };
 
@@ -407,15 +408,14 @@ function buildNormalizedReceipt(
     parseSource: params.parseSource,
   });
 
-  const merchantKey = merchantName.toLowerCase();
-  const orderKey = orderIdRaw.toLowerCase();
-  const dedupeKey = createHash("sha256")
-    .update(
-      `${params.userId}|${merchantKey}|${orderKey}|${purchaseDateIso}|${totalAmount.toFixed(
-        2
-      )}`
-    )
-    .digest("hex");
+  const dedupeKey = makeDedupeKey({
+    user_id: params.userId,
+    merchant: merchantName,
+    order_id: orderIdRaw,
+    purchase_date: purchaseDateIso,
+    currency,
+    total_amount: totalAmount,
+  });
 
   const raw_json = {
     gmail: params.gmail,
@@ -1182,7 +1182,7 @@ async function processMessage(
             dedupe_key: normalized.dedupe_key,
           },
         ],
-        { onConflict: "dedupe_key" }
+        { onConflict: "user_id,dedupe_key" }
       )
       .select("id")
       .single();
@@ -1396,7 +1396,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const processedLabelCache = new Map<string, string | null>();
-    const byUser = new Map<string, { merchants: string[]; source: "approved" | "auth" }>();
+    const byUser = new Map<
+      string,
+      { merchants: string[]; source: "approved" | "auth" | "none" }
+    >();
 
     const userIds = new Set<string>();
     if (requestedUser) {
