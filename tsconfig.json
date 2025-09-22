@@ -10,6 +10,6 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
 
-    "types": ["@types/node", "@vercel/node"]
+    "types": ["@types/node", "@vercel/node", "./types/jest"]
   }
 }

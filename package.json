@@ -3,6 +3,9 @@
   "version": "0.1.2",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "jest"
+  },
   "engines": { "node": ">=18" },
   "dependencies": {
     "@supabase/supabase-js": "^2.43.0",
@@ -12,8 +15,11 @@
     "tldts": "^6.1.24"
   },
   "devDependencies": {
+    "@types/jest": "^29.5.12",
     "@types/node": "^20.11.30",
     "@vercel/node": "^3.2.8",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
     "typescript": "^5.4.0"
   }
 }
