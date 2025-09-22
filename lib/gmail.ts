@@ -1,4 +1,6 @@
 // lib/gmail.ts
+// Assumes Gmail integrations always need offline access refresh tokens; trade-off is consistently
+// generating explicit OAuth params (no Base64 encoding) to simplify callback validation logic.
 import { google } from "googleapis";
 
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID || "";
@@ -14,13 +16,14 @@ export function createOAuthClient() {
   return new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 }
 
-export function getGmailAuthUrl(state: string): string {
+export function getGmailAuthUrl({ user }: { user: string }): string {
   const client = createOAuthClient();
   return client.generateAuthUrl({
     access_type: "offline",
     scope: SCOPES,
-    state,
+    state: JSON.stringify({ user }),
     prompt: "consent",
+    include_granted_scopes: false,
   });
 }
 
