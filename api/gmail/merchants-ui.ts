@@ -1,4 +1,6 @@
 // api/gmail/merchants-ui.ts
+// Assumes merchant payloads provide stable ids and human-friendly names; trade-off is handling
+// legacy string responses in the client so the checkbox list stays usable during rollout.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -32,6 +34,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   </main>
   <script>
     const user = ${JSON.stringify(user)};
+    function extractMerchantInfo(raw) {
+      if (!raw) return null;
+      if (typeof raw === 'string') {
+        const id = raw.trim();
+        if (!id) return null;
+        return { id, name: id };
+      }
+      if (typeof raw === 'object') {
+        const id = typeof raw.id === 'string' ? raw.id : typeof raw.domain === 'string' ? raw.domain : null;
+        if (!id) return null;
+        const name = typeof raw.name === 'string' && raw.name.trim().length > 0 ? raw.name.trim() : id;
+        return { id, name };
+      }
+      return null;
+    }
+
     async function load(){
       const list = document.getElementById('list');
       list.innerHTML = '<p>Loading...</p>';
@@ -48,19 +66,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           throw new Error('failed to load');
         }
         const data = await r.json();
-        if (!data.merchants || data.merchants.length === 0) {
+        const merchants = Array.isArray(data.merchants) ? data.merchants : [];
+        if (merchants.length === 0) {
           list.innerHTML = '<p>No merchants found.</p>';
           return;
         }
         list.innerHTML = '';
-        (data.merchants || []).forEach(m => {
+        merchants.forEach((raw) => {
+          const merchant = extractMerchantInfo(raw);
+          if (!merchant) return;
           const label = document.createElement('label');
           label.className = 'merchant';
           const cb = document.createElement('input');
           cb.type = 'checkbox';
-          cb.value = m;
+          cb.value = merchant.id;
           label.appendChild(cb);
-          label.appendChild(document.createTextNode(m));
+          label.appendChild(document.createTextNode(merchant.name));
           list.appendChild(label);
         });
       } catch (err) {

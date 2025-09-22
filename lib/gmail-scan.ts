@@ -1,6 +1,8 @@
 // lib/gmail-scan.ts
-// Assumes Supabase stores Gmail OAuth tokens with a status column alongside legacy fields;
-// trade-off is additional reads to surface status but keeps ingestion safely gated.
+// Assumes Supabase stores Gmail OAuth tokens with a status column alongside legacy fields; trade-off
+// is additional reads to surface status but keeps ingestion safely gated. Metadata fetches are
+// throttled to limit concurrent Gmail calls, trading a little latency for resilience against transient
+// DNS/socket failures.
 import { google } from "googleapis";
 import { getDomain } from "tldts";
 import { supabaseAdmin } from "./supabase-admin.js";
@@ -9,6 +11,20 @@ import { withRetry } from "./retry.js";
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID || "";
 const CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET || "";
 const REDIRECT_URI = process.env.GMAIL_REDIRECT_URI || "";
+
+const DEFAULT_METADATA_CONCURRENCY = 6;
+const MAX_METADATA_CONCURRENCY = 10;
+
+function resolveMetadataConcurrency(): number {
+  const raw = process.env.GMAIL_FETCH_CONCURRENCY;
+  const parsed = Number.parseInt(raw ?? "", 10);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.min(parsed, MAX_METADATA_CONCURRENCY);
+  }
+  return DEFAULT_METADATA_CONCURRENCY;
+}
+
+const METADATA_FETCH_CONCURRENCY = resolveMetadataConcurrency();
 
 /**
  * Fetch a valid Gmail access token for the user.
@@ -36,9 +52,15 @@ export async function getAccessToken(
   const client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
   const refreshToken = data.refresh_token as string;
   const accessToken = data.access_token as string | null;
-  const expiry = data.access_token_expires_at ? new Date(data.access_token_expires_at).getTime() : undefined;
+  const expiry = data.access_token_expires_at
+    ? new Date(data.access_token_expires_at).getTime()
+    : undefined;
 
-  client.setCredentials({ refresh_token: refreshToken, access_token: accessToken || undefined, expiry_date: expiry });
+  client.setCredentials({
+    refresh_token: refreshToken,
+    access_token: accessToken || undefined,
+    expiry_date: expiry,
+  });
   const { token } = await client.getAccessToken();
   if (!token) return null;
 
@@ -111,10 +133,10 @@ export async function getAccessToken(
 
 const HEADERS = ["From", "Subject", "Date"];
 
-const AGGREGATOR_BUCKETS: { domain: string; label: string }[] = [
-  { domain: "shopify.com", label: "Shopify Sellers" },
-  { domain: "squareup.com", label: "Square Sellers" },
-  { domain: "paypal.com", label: "PayPal Receipts" },
+const AGGREGATOR_BUCKETS: { id: string; label: string }[] = [
+  { id: "shopify.com", label: "Shopify Sellers" },
+  { id: "squareup.com", label: "Square Sellers" },
+  { id: "paypal.com", label: "PayPal Receipts" },
 ];
 
 function extractDomain(from: string): string | null {
@@ -143,19 +165,19 @@ function normalizeWhitespace(value: string): string {
     .trim();
 }
 
-function bucketForAggregator(domain: string | null): { domain: string; name: string } | null {
-  if (!domain) return null;
+function bucketForAggregator(id: string | null): { id: string; name: string } | null {
+  if (!id) return null;
   for (const bucket of AGGREGATOR_BUCKETS) {
-    if (domain === bucket.domain || domain.endsWith(`.${bucket.domain}`)) {
-      return { domain: bucket.domain, name: bucket.label };
+    if (id === bucket.id || id.endsWith(`.${bucket.id}`)) {
+      return { id: bucket.id, name: bucket.label };
     }
   }
   return null;
 }
 
-function toDisplayName(domain: string, fallback?: string | null): string {
-  const parts = domain.replace(/\.com$|\.net$|\.org$|\.co$|\.io$/i, "").split(".");
-  const base = parts[0] || fallback || domain;
+function toDisplayName(id: string, fallback?: string | null): string {
+  const parts = id.replace(/\.com$|\.net$|\.org$|\.co$|\.io$/i, "").split(".");
+  const base = parts[0] || fallback || id;
   return base
     .split(/[-_]/)
     .map((p) => (p ? p[0].toUpperCase() + p.slice(1) : ""))
@@ -163,32 +185,32 @@ function toDisplayName(domain: string, fallback?: string | null): string {
     .join(" ");
 }
 
-function buildMerchantName(
+function buildMerchantIdentity(
   domain: string | null,
   from: string,
   subject: string
-): { domain: string | null; name: string | null } {
+): { id: string | null; name: string | null } {
   if (domain) {
     const bucket = bucketForAggregator(domain);
     if (bucket) {
-      return { domain: bucket.domain, name: bucket.name };
+      return { id: bucket.id, name: bucket.name };
     }
   }
 
   const display = normalizeWhitespace(extractDisplayName(from) || "");
-  if (display) {
-    return { domain, name: display };
+  if (display && domain) {
+    return { id: domain, name: display };
   }
 
   if (domain) {
-    return { domain, name: toDisplayName(domain) };
+    return { id: domain, name: toDisplayName(domain) };
   }
 
   const subjectMerchant = extractMerchantFromSubject(subject);
   if (subjectMerchant) {
-    return { domain: null, name: normalizeWhitespace(subjectMerchant) };
+    return { id: null, name: normalizeWhitespace(subjectMerchant) };
   }
-  return { domain, name: null };
+  return { id: domain, name: null };
 }
 
 function computeDateWindow(monthsRaw?: string | number | null): string {
@@ -285,12 +307,16 @@ async function listMessages(
 
   const missingIds = ids.filter((id) => !headers.has(id));
   if (missingIds.length > 0) {
-    await Promise.all(
-      missingIds.map(async (id) => {
-        const meta = await fetchMetadata(gmail, id);
-        if (meta) headers.set(id, meta);
-      })
-    );
+    for (let i = 0; i < missingIds.length; i += METADATA_FETCH_CONCURRENCY) {
+      // Batch metadata fetches to avoid spamming Gmail with concurrent lookups.
+      const batch = missingIds.slice(i, i + METADATA_FETCH_CONCURRENCY);
+      await Promise.all(
+        batch.map(async (id) => {
+          const meta = await fetchMetadata(gmail, id);
+          if (meta) headers.set(id, meta);
+        })
+      );
+    }
   }
 
   return { ids, headers };
@@ -299,8 +325,8 @@ async function listMessages(
 export type MerchantDiscoverySource = "smartlabel" | "heuristic";
 
 export interface MerchantDiscoveryItem {
+  id: string;
   name: string;
-  domain: string;
   est_count: number;
   source: MerchantDiscoverySource;
 }
@@ -345,20 +371,22 @@ export async function scanGmailMerchants(
       const from = header.from || "";
       const subject = header.subject || "";
       const domain = extractDomain(from);
-      const { domain: mappedDomain, name } = buildMerchantName(domain, from, subject);
-      if (!mappedDomain || !name) continue;
-      const domainKey = mappedDomain.toLowerCase();
-      const existing = aggregates.get(domainKey);
+      const identity = buildMerchantIdentity(domain, from, subject);
+      if (!identity.id || !identity.name) continue;
+      const idKey = identity.id.toLowerCase();
+      const existing = aggregates.get(idKey);
       if (existing) {
         existing.est_count += 1;
         if (existing.source !== "smartlabel" && source === "smartlabel") {
           existing.source = "smartlabel";
         }
-        if (!existing.name && name) existing.name = name;
+        if (!existing.name && identity.name) {
+          existing.name = identity.name;
+        }
       } else {
-        aggregates.set(domainKey, {
-          domain: domainKey,
-          name,
+        aggregates.set(idKey, {
+          id: idKey,
+          name: identity.name,
           est_count: 1,
           source,
         });
@@ -382,8 +410,8 @@ export async function scanGmailMerchants(
     event: "discovery_complete",
     user_id: userId,
     merchants: merchants.length,
+    metadata_concurrency: METADATA_FETCH_CONCURRENCY,
   });
 
   return { merchants };
 }
-
