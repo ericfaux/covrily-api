@@ -1,6 +1,7 @@
 // api/gmail/ingest.ts
 // Assumes Gmail tokens carry status plus a legacy boolean so we can block ingestion cleanly;
-// trade-off is performing extra Supabase writes when scopes fail so both flags stay synced.
+// trade-off is performing extra Supabase writes when scopes fail so both flags stay synced while
+// insisting on approved merchant selections before scanning to honor consent.
 // Fetch Gmail messages for approved merchants and store receipts
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
@@ -797,8 +798,9 @@ export async function fetchReceiptFromLink(
       status === 403 ||
       (status === 302 && /login|signin/i.test(resp.headers.get("location") || ""))
     ) {
-      try {
-        await supabaseAdmin.from("pending_receipts").insert([
+      const { error: pendingError } = await supabaseAdmin
+        .from("pending_receipts")
+        .insert([
           {
             url,
             user_id: meta?.user_id || null,
@@ -809,8 +811,11 @@ export async function fetchReceiptFromLink(
             status_code: status,
           },
         ]);
-      } catch (e) {
-        console.error("[pending_receipts] insert failed:", e);
+      if (pendingError) {
+        console.error("[pending_receipts insert]", {
+          user_id: meta?.user_id || null,
+          error: pendingError,
+        });
       }
       console.warn(
         `[fetch-receipt-link] authentication required (${status}) for ${url}`
@@ -1146,6 +1151,11 @@ async function processMessage(
       .eq("dedupe_key", normalized.dedupe_key)
       .maybeSingle();
     if (existingQuery.error) {
+      console.error("[receipts select]", {
+        user_id: userId,
+        dedupe_key: normalized.dedupe_key,
+        error: existingQuery.error,
+      });
       throw existingQuery.error;
     }
     const existingRow = existingQuery.data;
@@ -1177,10 +1187,38 @@ async function processMessage(
       .select("id")
       .single();
 
+    if (upsertResult.error) {
+      console.error("[receipts upsert]", {
+        user_id: userId,
+        dedupe_key: normalized.dedupe_key,
+        error: upsertResult.error,
+      });
+      throw upsertResult.error;
+    }
+
     const receiptId = upsertResult.data?.id || existingRow?.id || null;
 
+    console.info("[gmail][ingest]", {
+      event: "receipt_upsert",
+      user_id: userId,
+      merchant: normalized.merchant,
+      dedupe_key: normalized.dedupe_key,
+      created: !existingRow && !!receiptId,
+    });
+
     if (receiptId) {
-      await supabaseAdmin.from("line_items").delete().eq("receipt_id", receiptId);
+      const { error: deleteItemsError } = await supabaseAdmin
+        .from("line_items")
+        .delete()
+        .eq("receipt_id", receiptId);
+      if (deleteItemsError) {
+        console.error("[line_items delete]", {
+          user_id: userId,
+          receipt_id: receiptId,
+          error: deleteItemsError,
+        });
+        throw deleteItemsError;
+      }
       if (normalized.line_items.length > 0) {
         const payloadItems = normalized.line_items.map((item) => ({
           receipt_id: receiptId,
@@ -1192,9 +1230,31 @@ async function processMessage(
         const insertItems = await supabaseAdmin
           .from("line_items")
           .insert(payloadItems);
-        if (insertItems.error && /column "sku"/i.test(insertItems.error.message || "")) {
-          const fallbackPayload = payloadItems.map(({ sku, ...rest }) => rest);
-          await supabaseAdmin.from("line_items").insert(fallbackPayload);
+        if (insertItems.error) {
+          const message = insertItems.error.message || "";
+          console.error("[line_items insert]", {
+            stage: "primary",
+            user_id: userId,
+            receipt_id: receiptId,
+            error: insertItems.error,
+          });
+          if (/column "sku"/i.test(message)) {
+            const fallbackPayload = payloadItems.map(({ sku, ...rest }) => rest);
+            const fallbackInsert = await supabaseAdmin
+              .from("line_items")
+              .insert(fallbackPayload);
+            if (fallbackInsert.error) {
+              console.error("[line_items insert]", {
+                stage: "fallback",
+                user_id: userId,
+                receipt_id: receiptId,
+                error: fallbackInsert.error,
+              });
+              throw fallbackInsert.error;
+            }
+          } else {
+            throw insertItems.error;
+          }
         }
       }
     }
@@ -1254,6 +1314,66 @@ async function modifyMessageLabels(
   }
 }
 
+function collectMerchantIds(rows: any[] | null | undefined): string[] {
+  const ids = new Set<string>();
+  if (!Array.isArray(rows)) return [];
+  for (const row of rows) {
+    const value =
+      typeof row?.merchant === "string" ? row.merchant.trim().toLowerCase() : "";
+    if (value) ids.add(value);
+  }
+  return Array.from(ids);
+}
+
+async function loadMerchantIdsForUser(
+  userId: string
+): Promise<{ merchants: string[]; source: "approved" | "auth" | "none" }> {
+  const { data: approved, error: approvedError } = await supabaseAdmin
+    .from("approved_merchants")
+    .select("merchant")
+    .eq("user_id", userId);
+  if (approvedError) {
+    console.error("[gmail][ingest] failed to load approved merchants", {
+      user_id: userId,
+      error: approvedError,
+    });
+    throw approvedError;
+  }
+  const approvedIds = collectMerchantIds(approved);
+  console.info("[gmail][ingest]", {
+    event: "merchants_loaded",
+    table: "approved_merchants",
+    user_id: userId,
+    count: approvedIds.length,
+  });
+  if (approvedIds.length > 0) {
+    return { merchants: approvedIds, source: "approved" };
+  }
+
+  const { data: authRows, error: authError } = await supabaseAdmin
+    .from("auth_merchants")
+    .select("merchant")
+    .eq("user_id", userId);
+  if (authError) {
+    console.error("[gmail][ingest] failed to load discovered merchants", {
+      user_id: userId,
+      error: authError,
+    });
+    throw authError;
+  }
+  const authIds = collectMerchantIds(authRows);
+  console.info("[gmail][ingest]", {
+    event: "merchants_loaded",
+    table: "auth_merchants",
+    user_id: userId,
+    count: authIds.length,
+  });
+  if (authIds.length > 0) {
+    return { merchants: authIds, source: "auth" };
+  }
+  return { merchants: [], source: "none" };
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST" && req.method !== "GET") {
     res.setHeader("Allow", "GET,POST");
@@ -1261,37 +1381,87 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const userFilter = (req.query.user as string) || "";
-    let query = supabaseAdmin
-      .from("approved_merchants")
-      .select("user_id, merchant");
-    if (userFilter) query = query.eq("user_id", userFilter);
-    const { data, error } = await query;
-
-    if (error || !data) {
-      return res.status(500).json({ ok: false, error: error?.message });
+    const queryUser = ((req.query.user as string) || "").trim();
+    let requestedUser = queryUser;
+    if (req.method === "POST") {
+      const rawBody = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body;
+      const bodyUser =
+        rawBody && typeof rawBody.user === "string" ? rawBody.user.trim() : "";
+      if (bodyUser) {
+        requestedUser = bodyUser;
+      }
+      if (!requestedUser) {
+        return res.status(400).json({ ok: false, error: "missing user" });
+      }
     }
 
     const processedLabelCache = new Map<string, string | null>();
-    const byUser = new Map<string, string[]>();
+    const byUser = new Map<string, { merchants: string[]; source: "approved" | "auth" }>();
 
-    for (const row of data) {
-      const userId = row.user_id as string;
-      const merchant = row.merchant as string;
-      if (!userId || !merchant) continue;
-      const list = byUser.get(userId);
-      if (list) {
-        list.push(merchant);
-      } else {
-        byUser.set(userId, [merchant]);
+    const userIds = new Set<string>();
+    if (requestedUser) {
+      userIds.add(requestedUser);
+    } else {
+      const { data: approvedUsers, error: approvedUsersError } = await supabaseAdmin
+        .from("approved_merchants")
+        .select("user_id");
+      if (approvedUsersError) {
+        console.error("[gmail][ingest] failed to list approved users", {
+          error: approvedUsersError,
+        });
+        return res.status(500).json({ ok: false, error: "failed_to_load_merchants" });
       }
+      for (const row of approvedUsers || []) {
+        const value = typeof row?.user_id === "string" ? row.user_id.trim() : "";
+        if (value) userIds.add(value);
+      }
+
+      if (userIds.size === 0) {
+        const { data: authUsers, error: authUsersError } = await supabaseAdmin
+          .from("auth_merchants")
+          .select("user_id");
+        if (authUsersError) {
+          console.error("[gmail][ingest] failed to list discovery users", {
+            error: authUsersError,
+          });
+          return res.status(500).json({ ok: false, error: "failed_to_load_merchants" });
+        }
+        for (const row of authUsers || []) {
+          const value = typeof row?.user_id === "string" ? row.user_id.trim() : "";
+          if (value) userIds.add(value);
+        }
+      }
+    }
+
+    for (const userId of userIds) {
+      const { merchants, source } = await loadMerchantIdsForUser(userId);
+      if (merchants.length === 0) {
+        if (requestedUser) {
+          return res
+            .status(400)
+            .json({ ok: false, error: "no_merchants_selected" });
+        }
+        continue;
+      }
+      byUser.set(userId, { merchants, source });
+      console.info("[gmail][ingest]", {
+        event: "merchants_selected",
+        user_id: userId,
+        source,
+        count: merchants.length,
+      });
+    }
+
+    if (byUser.size === 0) {
+      return res.status(400).json({ ok: false, error: "no_merchants_selected" });
     }
 
     const dateStr = computeSinceDate(
       process.env.GMAIL_INGEST_MONTHS || process.env.GMAIL_DISCOVERY_MONTHS
     );
 
-    for (const [userId, merchantList] of byUser) {
+    for (const [userId, info] of byUser) {
+      const merchantList = info.merchants;
       const tokens = await getAccessToken(userId);
       if (!tokens) continue;
 
@@ -1315,6 +1485,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           event: "scan_started",
           user_id: userId,
           merchants: uniqueMerchants.length,
+          merchant_source: info.source,
         });
 
         for (const merchant of uniqueMerchants) {
@@ -1381,17 +1552,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   } catch (err: any) {
     if (err instanceof GmailReauthRequiredError) {
       if (err.userId) {
-        try {
-          await supabaseAdmin
-            .from("gmail_tokens")
-            .update({
-              status: "reauth_required",
-              reauth_required: true,
-              granted_scopes: err.grantedScopes,
-            })
-            .eq("user_id", err.userId);
-        } catch (updateErr) {
-          console.error("[gmail] failed to flag reauth requirement", updateErr);
+        const { error: tokenUpdateError } = await supabaseAdmin
+          .from("gmail_tokens")
+          .update({
+            status: "reauth_required",
+            reauth_required: true,
+            granted_scopes: err.grantedScopes,
+          })
+          .eq("user_id", err.userId);
+        if (tokenUpdateError) {
+          console.error("[gmail_tokens update]", {
+            user_id: err.userId,
+            error: tokenUpdateError,
+          });
         }
       }
       return res.status(err.statusCode).json({

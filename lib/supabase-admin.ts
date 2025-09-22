@@ -1,13 +1,18 @@
 // lib/supabase-admin.ts
+// Assumes runtime always supplies service role credentials for privileged writes;
+// trade-off is failing fast during init instead of attempting degraded anon access.
 import { createClient } from "@supabase/supabase-js";
 
 const url = process.env.SUPABASE_URL;
-const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!url) {
+  throw new Error("SUPABASE_URL not set – admin writes will fail");
+}
 
-if (!url || !serviceKey) {
-  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars.");
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!serviceKey) {
+  throw new Error("SUPABASE_SERVICE_ROLE_KEY not set – admin writes will fail");
 }
 
 export const supabaseAdmin = createClient(url, serviceKey, {
-  auth: { persistSession: false, autoRefreshToken: false }
+  auth: { persistSession: false, autoRefreshToken: false },
 });
