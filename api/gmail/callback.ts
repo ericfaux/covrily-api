@@ -1,31 +1,43 @@
 // api/gmail/callback.ts
-// Assumes Supabase already stores prior refresh tokens; trade-off is an extra read when Google omits a refresh token so we do not break reauth'd users.
+// Assumes Gmail OAuth state arrives as plain JSON and Supabase retains prior refresh tokens; trade-off
+// is rejecting tampered state with a 400 while doing an extra read when Google omits refresh tokens so
+// reauthorized users keep working.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { createOAuthClient, exchangeCodeForTokens } from "../../lib/gmail.js";
+import { exchangeCodeForTokens, getTokenInfo } from "../../lib/gmail.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const code = typeof req.query.code === "string" ? req.query.code : "";
+  const rawState = req.query.state;
+  if (typeof rawState !== "string" || !rawState.trim()) {
+    return res.status(400).send("Missing or invalid state");
+  }
+
   let user = "";
   try {
-    const code = (req.query.code as string) || "";
-    const state = (req.query.state as string) || "";
-    if (!code || !state) throw new Error("missing code or state");
-
-    try {
-      const parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
-      user = parsed.user;
-    } catch {
-      throw new Error("invalid state");
+    // State payload is JSON encoded upstream; reject anything else so we surface tampering quickly.
+    const parsedState = JSON.parse(rawState);
+    if (
+      !parsedState ||
+      typeof parsedState !== "object" ||
+      typeof (parsedState as any).user !== "string" ||
+      !(parsedState as any).user.trim()
+    ) {
+      return res.status(400).send("Missing or invalid state");
     }
-    if (!user) throw new Error("missing user");
+    user = (parsedState as any).user.trim();
+  } catch {
+    return res.status(400).send("Missing or invalid state");
+  }
 
+  try {
     const maskedUser =
       user.length > 8 ? `${user.slice(0, 4)}…${user.slice(-2)}` : user || "unknown";
 
+    if (!code) throw new Error("missing code");
+
     const tokens = await exchangeCodeForTokens(code);
     const expires = tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : null;
-
-    const client = createOAuthClient();
 
     // Preserve an existing refresh token if Google does not return one on this callback.
     let refreshToken = tokens.refresh_token || null;
@@ -51,12 +63,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       throw new Error("missing refresh token");
     }
 
-    client.setCredentials({ ...tokens, refresh_token: refreshToken });
-
     let grantedScopes: string[] = [];
     if (tokens.access_token) {
       try {
-        const info = await client.getTokenInfo(tokens.access_token);
+        const info = await getTokenInfo(tokens.access_token);
         const scopes = Array.isArray(info?.scopes)
           ? info.scopes
           : typeof (info as any)?.scope === "string"
@@ -74,7 +84,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    await supabaseAdmin
+    const { error: upsertError } = await supabaseAdmin
       .from("gmail_tokens")
       .upsert(
         {
@@ -84,9 +94,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           access_token_expires_at: expires,
           granted_scopes: grantedScopes,
           status: "active",
+          reauth_required: false,
         },
         { onConflict: "user_id" }
       );
+
+    if (upsertError) {
+      throw upsertError;
+    }
 
     if (grantedScopes.length > 0) {
       console.info("[gmail] linked user scopes", {
@@ -95,9 +110,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    res.redirect(302, `/api/gmail/merchants-ui?user=${encodeURIComponent(user)}`);
+    return res.redirect(302, `/api/gmail/merchants-ui?user=${encodeURIComponent(user)}`);
   } catch (e: any) {
     const qs = user ? `user=${encodeURIComponent(user)}&` : "";
-    res.redirect(302, `/api/gmail/ui?${qs}status=error`);
+    return res.redirect(302, `/api/gmail/ui?${qs}status=error`);
   }
 }

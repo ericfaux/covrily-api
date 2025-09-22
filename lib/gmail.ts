@@ -1,6 +1,6 @@
 // lib/gmail.ts
-// Assumes Gmail integrations always need offline access refresh tokens; trade-off is consistently
-// generating explicit OAuth params (no Base64 encoding) to simplify callback validation logic.
+// Assumes Gmail OAuth flows always request offline access and inspect token metadata; trade-off is
+// making an extra token info request during callback processing so we persist accurate scopes.
 import { google } from "googleapis";
 
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID || "";
@@ -31,4 +31,9 @@ export async function exchangeCodeForTokens(code: string) {
   const client = createOAuthClient();
   const { tokens } = await client.getToken(code);
   return tokens;
+}
+
+export async function getTokenInfo(accessToken: string) {
+  const client = createOAuthClient();
+  return client.getTokenInfo(accessToken);
 }
