@@ -155,10 +155,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       if (normalized.length > 0) {
         const payload = normalized.map((item) => ({
+          // Only persist identifiers because auth_merchants schema currently exposes
+          // { user_id, merchant }. Additional metadata stays in memory for UI rendering.
           user_id: user,
           merchant: item.id,
-          est_count: item.est_count,
-          source: item.source,
         }));
         const { error } = await supabaseAdmin
           .from("auth_merchants")
