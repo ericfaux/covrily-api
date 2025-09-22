@@ -145,7 +145,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const { merchants } = await scanGmailMerchants(user, tokens);
       const normalized = normalizeMerchants(merchants);
 
-      await supabaseAdmin.from("auth_merchants").delete().eq("user_id", user);
+      const deleteResult = await supabaseAdmin
+        .from("auth_merchants")
+        .delete()
+        .eq("user_id", user);
+      if (deleteResult.error) {
+        console.error("[auth_merchants delete]", { user, error: deleteResult.error });
+        throw deleteResult.error;
+      }
       if (normalized.length > 0) {
         const payload = normalized.map((item) => ({
           user_id: user,
@@ -153,9 +160,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           est_count: item.est_count,
           source: item.source,
         }));
-        await supabaseAdmin
+        const { error } = await supabaseAdmin
           .from("auth_merchants")
           .upsert(payload, { onConflict: "user_id,merchant" });
+        if (error) {
+          console.error("[auth_merchants upsert]", { user, error });
+          throw error;
+        }
       }
 
       return res.status(200).json({ ok: true, merchants: normalized });

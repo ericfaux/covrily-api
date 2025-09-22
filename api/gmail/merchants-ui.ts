@@ -23,6 +23,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .merchant { display: flex; align-items: center; margin: 0.25rem 0; }
     .merchant input { margin-right: 0.5rem; }
     #save { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+    #status { margin-top: 1rem; font-style: italic; }
   </style>
 </head>
 <body>
@@ -31,6 +32,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     <p>Choose the merchants whose receipts you'd like to import.</p>
     <div id="list"></div>
     <button id="save">Save</button>
+    <p id="status" role="status"></p>
   </main>
   <script>
     const user = ${JSON.stringify(user)};
@@ -89,14 +91,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
     document.getElementById('save').onclick = async () => {
+      const button = document.getElementById('save');
+      const status = document.getElementById('status');
+      if (!(button instanceof HTMLButtonElement) || !(status instanceof HTMLElement)) {
+        return;
+      }
       const selected = Array.from(document.querySelectorAll('#list input[type="checkbox"]:checked')).map(cb => cb.value);
-      await fetch('/api/gmail/merchants', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user, merchants: selected })
-      });
-      await fetch('/api/gmail/ingest?user=' + encodeURIComponent(user), { method: 'POST' });
-      alert('Saved');
+      button.disabled = true;
+      status.textContent = 'Scanning…';
+      try {
+        const saveResp = await fetch('/api/gmail/merchants', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user, merchants: selected })
+        });
+        if (!saveResp.ok) {
+          throw new Error('save_failed');
+        }
+        const ingestResp = await fetch('/api/gmail/ingest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user })
+        });
+        if (!ingestResp.ok) {
+          let message = 'failed to scan';
+          try {
+            const payload = await ingestResp.json();
+            if (payload && typeof payload.error === 'string' && payload.error.length > 0) {
+              message = payload.error;
+            }
+          } catch (err) {
+            // ignore body parse errors; we only need a fallback message
+          }
+          status.textContent = 'Scan failed: ' + message;
+          button.disabled = false;
+          return;
+        }
+        status.textContent = 'Scan complete! You can close this tab.';
+      } catch (err) {
+        status.textContent = 'Failed to save selections.';
+        button.disabled = false;
+      }
     };
     load();
   </script>
