@@ -1,6 +1,29 @@
 -- WARNING: This schema is for context only and is not meant to be run.
 -- Table order and constraints may not be valid for execution.
 
+CREATE TABLE public.amazon_orders (
+  user_id uuid NOT NULL,
+  order_number text NOT NULL,
+  return_or_replace_date timestamp with time zone,
+  total_total_amount numeric,
+  product_name_short text,
+  return_html text,
+  CONSTRAINT amazon_orders_pkey PRIMARY KEY (user_id, order_number),
+  CONSTRAINT amazon_orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.profiles(id)
+);
+CREATE TABLE public.approved_merchants (
+  user_id uuid NOT NULL,
+  merchant text NOT NULL,
+  CONSTRAINT approved_merchants_pkey PRIMARY KEY (merchant, user_id)
+);
+CREATE TABLE public.auth_merchants (
+  user_id uuid NOT NULL,
+  merchant text NOT NULL,
+  inserted_at timestamp with time zone DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT auth_merchants_pkey PRIMARY KEY (merchant, user_id),
+  CONSTRAINT auth_merchants_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
+);
 CREATE TABLE public.claims (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL,
@@ -10,8 +33,8 @@ CREATE TABLE public.claims (
   payload jsonb,
   submitted_at timestamp with time zone,
   CONSTRAINT claims_pkey PRIMARY KEY (id),
-  CONSTRAINT claims_receipt_id_fkey FOREIGN KEY (receipt_id) REFERENCES public.receipts(id),
-  CONSTRAINT claims_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
+  CONSTRAINT claims_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id),
+  CONSTRAINT claims_receipt_id_fkey FOREIGN KEY (receipt_id) REFERENCES public.receipts(id)
 );
 CREATE TABLE public.deadlines (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -41,8 +64,19 @@ CREATE TABLE public.decisions (
   notes text,
   created_at timestamp with time zone DEFAULT now(),
   CONSTRAINT decisions_pkey PRIMARY KEY (id),
-  CONSTRAINT decisions_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id),
-  CONSTRAINT decisions_receipt_id_fkey FOREIGN KEY (receipt_id) REFERENCES public.receipts(id)
+  CONSTRAINT decisions_receipt_id_fkey FOREIGN KEY (receipt_id) REFERENCES public.receipts(id),
+  CONSTRAINT decisions_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
+);
+CREATE TABLE public.gmail_tokens (
+  user_id uuid NOT NULL,
+  refresh_token text,
+  access_token text,
+  access_token_expires_at timestamp with time zone,
+  granted_scopes ARRAY DEFAULT '{}'::text[],
+  reauth_required boolean DEFAULT false,
+  status text DEFAULT 'active'::text,
+  CONSTRAINT gmail_tokens_pkey PRIMARY KEY (user_id),
+  CONSTRAINT gmail_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
 );
 CREATE TABLE public.inbound_emails (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -65,6 +99,28 @@ CREATE TABLE public.line_items (
   CONSTRAINT line_items_pkey PRIMARY KEY (id),
   CONSTRAINT line_items_receipt_id_fkey FOREIGN KEY (receipt_id) REFERENCES public.receipts(id),
   CONSTRAINT line_items_product_id_fkey FOREIGN KEY (product_id) REFERENCES public.products(id)
+);
+CREATE TABLE public.merchant_master_data (
+  merchant_id uuid NOT NULL DEFAULT gen_random_uuid(),
+  merchant_name text NOT NULL UNIQUE,
+  policy_id uuid,
+  created_at timestamp with time zone DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT merchant_master_data_pkey PRIMARY KEY (merchant_id),
+  CONSTRAINT merchant_master_data_policy_id_fkey FOREIGN KEY (policy_id) REFERENCES public.policies(id)
+);
+CREATE TABLE public.pending_receipts (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id uuid,
+  message_id text,
+  url text NOT NULL,
+  merchant text,
+  subject text,
+  from_header text,
+  status_code integer,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT pending_receipts_pkey PRIMARY KEY (id),
+  CONSTRAINT pending_receipts_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
 );
 CREATE TABLE public.policies (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -141,44 +197,11 @@ CREATE TABLE public.receipts (
   created_at timestamp with time zone DEFAULT now(),
   shipping_cents integer,
   subtotal_cents integer,
+  dedupe_key text,
+  parse_source text,
+  confidence numeric,
+  email_message_id text,
+  receipt_url text,
   CONSTRAINT receipts_pkey PRIMARY KEY (id),
   CONSTRAINT receipts_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
-);
-
-CREATE TABLE public.auth_merchants (
-  user_id uuid NOT NULL,
-  merchant text NOT NULL,
-  CONSTRAINT auth_merchants_pkey PRIMARY KEY (user_id, merchant)
-);
-
-CREATE TABLE public.approved_merchants (
-  user_id uuid NOT NULL,
-  merchant text NOT NULL,
-  CONSTRAINT approved_merchants_pkey PRIMARY KEY (user_id, merchant)
-);
-
-CREATE TABLE public.gmail_tokens (
-  user_id uuid NOT NULL,
-  refresh_token text,
-  access_token text,
-  access_token_expires_at timestamp with time zone,
-  granted_scopes text[] DEFAULT '{}'::text[],
-  reauth_required boolean DEFAULT false,
-  status text DEFAULT 'active'::text,
-  CONSTRAINT gmail_tokens_pkey PRIMARY KEY (user_id),
-  CONSTRAINT gmail_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
-);
-
-CREATE TABLE public.pending_receipts (
-  id uuid NOT NULL DEFAULT gen_random_uuid(),
-  user_id uuid,
-  message_id text,
-  url text NOT NULL,
-  merchant text,
-  subject text,
-  from_header text,
-  status_code integer,
-  created_at timestamp with time zone DEFAULT now(),
-  CONSTRAINT pending_receipts_pkey PRIMARY KEY (id),
-  CONSTRAINT pending_receipts_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
 );
