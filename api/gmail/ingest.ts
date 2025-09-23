@@ -152,6 +152,16 @@ function sanitizeKey(value: string): string {
     .trim();
 }
 
+function normalizeOrderIdValue(value: unknown): string | null {
+  // Keep Supabase rows aligned with the legacy unique constraint by dropping placeholder IDs.
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "-") {
+    return null;
+  }
+  return trimmed;
+}
+
 function getMerchantDomains(raw: string): string[] {
   const domains = new Set<string>();
   const normalized = sanitizeKey(raw);
@@ -1309,7 +1319,10 @@ async function processMessage(
         : null;
 
     const merchantForRow = normalized.merchant;
-    const orderIdForRow = normalized.order_id || null;
+    const orderIdForRow =
+      normalizeOrderIdValue(parsed?.order_id ?? null) ??
+      normalizeOrderIdValue(normalized.order_id) ??
+      null;
     const purchaseDateForRow = normalized.purchase_date;
     const currencyForRow = normalized.currency || "USD";
     const dedupeKey = makeDedupeKey({
@@ -1368,7 +1381,7 @@ async function processMessage(
 
     const upsertResult = await supabaseAdmin
       .from("receipts")
-      .upsert(row, { onConflict: "user_id,dedupe_key" })
+      .upsert(row, { onConflict: "user_id,merchant,order_id,purchase_date" })
       .select("id")
       .maybeSingle();
 
@@ -1376,6 +1389,9 @@ async function processMessage(
       console.error("[receipts upsert]", {
         user_id: row.user_id,
         dedupe_key: row.dedupe_key,
+        merchant: row.merchant,
+        order_id: row.order_id,
+        purchase_date: row.purchase_date,
         error: upsertResult.error,
       });
       throw new ReceiptUpsertError(row.user_id, row.dedupe_key, upsertResult.error);
