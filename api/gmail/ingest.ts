@@ -1256,48 +1256,96 @@ async function processMessage(
     }
     (parsed as any).confidence = resolvedConfidence;
 
-    const row = {
+    const rawParsedCents = (parsed as any)?.total_cents;
+    let resolvedTotalCents: number | null = null;
+    if (
+      typeof rawParsedCents === "number" &&
+      Number.isFinite(rawParsedCents)
+    ) {
+      resolvedTotalCents = Math.round(rawParsedCents);
+    } else if (typeof rawParsedCents === "string") {
+      const cleanedCents = rawParsedCents.replace(/[^0-9-]/g, "");
+      if (cleanedCents) {
+        const parsedCents = Number.parseInt(cleanedCents, 10);
+        if (Number.isFinite(parsedCents)) {
+          resolvedTotalCents = Math.round(parsedCents);
+        }
+      }
+    }
+    if (resolvedTotalCents == null) {
+      const rawTotalAmount = (parsed as any)?.total_amount;
+      const parsedAmount = parsePriceValue(rawTotalAmount);
+      if (parsedAmount != null) {
+        resolvedTotalCents = Math.round(parsedAmount * 100);
+      }
+    }
+    if (resolvedTotalCents == null) {
+      if (
+        typeof normalized.total_cents === "number" &&
+        Number.isFinite(normalized.total_cents)
+      ) {
+        resolvedTotalCents = Math.round(normalized.total_cents);
+      } else if (
+        typeof normalized.total_amount === "number" &&
+        Number.isFinite(normalized.total_amount)
+      ) {
+        resolvedTotalCents = Math.round(normalized.total_amount * 100);
+      }
+    }
+    if (resolvedTotalCents == null) {
+      return false;
+    }
+
+    const parsedSourceValue = (parsed as any)?.source;
+    const rowParseSource: ParseSourceType | null =
+      parsedSourceValue === "rules" || parsedSourceValue === "llm"
+        ? parsedSourceValue
+        : null;
+    const parsedConfidenceValue = (parsed as any)?.confidence;
+    const rowConfidence =
+      typeof parsedConfidenceValue === "number" &&
+      Number.isFinite(parsedConfidenceValue)
+        ? Number(parsedConfidenceValue.toFixed(2))
+        : null;
+
+    const merchantForRow = normalized.merchant;
+    const orderIdForRow = normalized.order_id || null;
+    const purchaseDateForRow = normalized.purchase_date;
+    const currencyForRow = normalized.currency || "USD";
+    const dedupeKey = makeDedupeKey({
       user_id: userId,
-      merchant: normalized.merchant,
-      order_id: normalized.order_id || null,
-      purchase_date: normalized.purchase_date,
-      currency: normalized.currency || "USD",
-      total_cents: normalized.total_cents,
-      tax_cents: normalized.tax_cents,
-      shipping_cents: normalized.shipping_cents,
-      source: "gmail",
-      email_message_id: normalized.email_message_id,
-      parse_source: resolvedParseSource,
-      confidence: resolvedConfidence,
-      receipt_url: normalized.receipt_url,
-      raw_json: normalized.raw_json,
-    } as {
+      merchant: merchantForRow,
+      order_id: orderIdForRow,
+      purchase_date: purchaseDateForRow,
+      currency: currencyForRow,
+      total_cents: resolvedTotalCents,
+    });
+
+    const row: {
       user_id: string;
       merchant: string;
       order_id: string | null;
       purchase_date: string;
       currency: string;
       total_cents: number;
-      tax_cents: number | null;
-      shipping_cents: number | null;
-      source: string;
       email_message_id: string;
       parse_source: ParseSourceType | null;
       confidence: number | null;
-      receipt_url: string | null;
-      raw_json: any;
-      dedupe_key?: string;
+      dedupe_key: string;
+    } = {
+      user_id: userId,
+      merchant: merchantForRow,
+      order_id: orderIdForRow,
+      purchase_date: purchaseDateForRow,
+      currency: currencyForRow,
+      total_cents: resolvedTotalCents,
+      email_message_id: normalized.email_message_id,
+      parse_source: rowParseSource,
+      confidence: rowConfidence,
+      dedupe_key: dedupeKey,
     };
 
-    row.dedupe_key = makeDedupeKey({
-      user_id: row.user_id,
-      merchant: row.merchant,
-      order_id: row.order_id,
-      purchase_date: row.purchase_date,
-      currency: row.currency || "USD",
-      total_cents: row.total_cents,
-    });
-
+    normalized.total_cents = row.total_cents;
     normalized.dedupe_key = row.dedupe_key;
     normalized.parse_source = row.parse_source;
     normalized.confidence = row.confidence;
