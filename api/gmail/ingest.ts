@@ -2,9 +2,9 @@
 // Assumes Gmail tokens carry status plus a legacy boolean so we can block ingestion cleanly;
 // trade-off is performing extra Supabase writes when scopes fail so both flags stay synced while
 // insisting on approved merchant selections before scanning to honor consent, and we canonicalize
-// receipt identifiers before hashing so dedupe keys stay stable at the cost of extra normalization,
-// also trusting parser-provided source/confidence first so ingest telemetry matches parser truth
-// while backfilling gaps with heuristics when parsers omit metadata.
+// receipt identifiers from currency-aware minor units before hashing so dedupe keys stay stable at
+// the cost of extra normalization, also trusting parser-provided source/confidence first so ingest
+// telemetry matches parser truth while backfilling gaps with heuristics when parsers omit metadata.
 // Fetch Gmail messages for approved merchants and store receipts
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
@@ -97,6 +97,51 @@ function computeSinceDate(raw?: string | number | null): string {
   const mm = String(since.getMonth() + 1).padStart(2, "0");
   const dd = String(since.getDate()).padStart(2, "0");
   return `${yyyy}/${mm}/${dd}`;
+}
+
+const ZERO_DECIMAL_CURRENCIES = new Set<string>([
+  "BIF",
+  "CLP",
+  "DJF",
+  "GNF",
+  "JPY",
+  "KMF",
+  "KRW",
+  "MGA",
+  "PYG",
+  "RWF",
+  "UGX",
+  "VND",
+  "VUV",
+  "XAF",
+  "XOF",
+  "XPF",
+]);
+
+const THREE_DECIMAL_CURRENCIES = new Set<string>(["BHD", "JOD", "KWD", "OMR", "TND"]);
+
+function resolveCurrencyCode(value: string | null | undefined): string {
+  const normalized = (value || "USD").toString().trim().toUpperCase();
+  return normalized || "USD";
+}
+
+function currencyMinorUnitDigits(currency: string): number {
+  // Preserve ISO-4217 minor unit expectations so stored cents align with Supabase schema.
+  if (THREE_DECIMAL_CURRENCIES.has(currency)) return 3;
+  if (ZERO_DECIMAL_CURRENCIES.has(currency)) return 0;
+  return 2;
+}
+
+function convertAmountToMinorUnits(amount: number, currency: string): number {
+  const decimals = currencyMinorUnitDigits(currency);
+  const multiplier = 10 ** decimals;
+  return Math.round(amount * multiplier);
+}
+
+function convertMinorUnitsToAmount(value: number, currency: string): number {
+  const decimals = currencyMinorUnitDigits(currency);
+  const multiplier = 10 ** decimals;
+  return Number((value / multiplier).toFixed(decimals));
 }
 
 function sanitizeKey(value: string): string {
@@ -208,6 +253,7 @@ interface BuildReceiptParams {
   orderId: string | null;
   purchaseDate: string | null;
   totalCents: any;
+  totalAmount: any;
   taxCents: any;
   shippingCents: any;
   currency: string | null;
@@ -381,23 +427,29 @@ function buildNormalizedReceipt(
   );
   const orderIdRaw = (params.orderId || "").toString().trim();
   const purchaseDateIso = normalizeDate(params.purchaseDate);
-  const totalCents = normalizeCents(params.totalCents);
+  const currency = resolveCurrencyCode(params.currency);
+  let totalCents = normalizeCents(params.totalCents);
+  if (totalCents == null) {
+    const parsedAmount = parsePriceValue(params.totalAmount);
+    if (parsedAmount != null) {
+      totalCents = convertAmountToMinorUnits(parsedAmount, currency);
+    }
+  }
   const taxCents = normalizeCents(params.taxCents);
   const shippingCents = normalizeCents(params.shippingCents);
-  const currency = (params.currency || "USD")
-    .toString()
-    .trim()
-    .toUpperCase() || "USD";
   const lineItems = convertLineItems(params.items);
 
   if (!merchantName || !orderIdRaw || !purchaseDateIso || totalCents == null) {
     return null;
   }
 
-  const totalAmount = Number((totalCents / 100).toFixed(2));
-  const taxes = taxCents != null ? Number((taxCents / 100).toFixed(2)) : null;
+  const totalAmount = convertMinorUnitsToAmount(totalCents, currency);
+  const taxes =
+    taxCents != null ? convertMinorUnitsToAmount(taxCents, currency) : null;
   const shipping =
-    shippingCents != null ? Number((shippingCents / 100).toFixed(2)) : null;
+    shippingCents != null
+      ? convertMinorUnitsToAmount(shippingCents, currency)
+      : null;
 
   const confidence = computeConfidence({
     hasMerchant: !!merchantName,
@@ -416,7 +468,7 @@ function buildNormalizedReceipt(
     order_id: orderIdRaw,
     purchase_date: purchaseDateIso,
     currency,
-    total_amount: totalAmount,
+    total_cents: totalCents,
   });
 
   const raw_json = {
@@ -1048,6 +1100,7 @@ async function processMessage(
     let orderId = (parsed as any)?.order_id ?? null;
     let purchaseDateRaw = (parsed as any)?.purchase_date ?? null;
     let totalCents = (parsed as any)?.total_cents ?? null;
+    let totalAmount = (parsed as any)?.total_amount ?? null;
     let taxCents = (parsed as any)?.tax_cents ?? null;
     let shippingCents = (parsed as any)?.shipping_cents ?? null;
     let currency = (parsed as any)?.currency ?? null;
@@ -1060,7 +1113,7 @@ async function processMessage(
       merchantValue === "unknown" ||
       !orderId ||
       !purchaseDateRaw ||
-      totalCents == null;
+      (totalCents == null && totalAmount == null);
 
     if (essentialsMissing()) {
       receiptLink = await findReceiptLink(payload, from);
@@ -1089,6 +1142,10 @@ async function processMessage(
           if (totalCents == null && linkParsed.total_cents != null) {
             totalCents = linkParsed.total_cents;
             (parsed as any).total_cents = linkParsed.total_cents;
+          }
+          if (totalAmount == null && (linkParsed as any).total_amount != null) {
+            totalAmount = (linkParsed as any).total_amount;
+            (parsed as any).total_amount = (linkParsed as any).total_amount;
           }
           if (taxCents == null && (linkParsed as any).tax_cents != null) {
             taxCents = (linkParsed as any).tax_cents;
@@ -1122,6 +1179,10 @@ async function processMessage(
         if (!orderId && llm.order_id) orderId = llm.order_id;
         if (!purchaseDateRaw && llm.purchase_date) purchaseDateRaw = llm.purchase_date;
         if (totalCents == null && llm.total_cents != null) totalCents = llm.total_cents;
+        if (totalAmount == null && (llm as any).total_amount != null) {
+          totalAmount = (llm as any).total_amount;
+          (parsed as any).total_amount = (llm as any).total_amount;
+        }
         if (taxCents == null && llm.tax_cents != null) taxCents = llm.tax_cents;
         if (shippingCents == null && llm.shipping_cents != null)
           shippingCents = llm.shipping_cents;
@@ -1138,7 +1199,7 @@ async function processMessage(
       merchant: merchantForLog,
       order_id_found: !!orderId,
       purchase_date_found: !!purchaseDateRaw,
-      total_cents_found: totalCents != null,
+      total_cents_found: totalCents != null || totalAmount != null,
     });
 
     const normalized = buildNormalizedReceipt({
@@ -1148,6 +1209,7 @@ async function processMessage(
       orderId,
       purchaseDate: purchaseDateRaw,
       totalCents,
+      totalAmount,
       taxCents,
       shippingCents,
       currency,
@@ -1200,7 +1262,6 @@ async function processMessage(
       order_id: normalized.order_id || null,
       purchase_date: normalized.purchase_date,
       currency: normalized.currency || "USD",
-      total_amount: normalized.total_amount,
       total_cents: normalized.total_cents,
       tax_cents: normalized.tax_cents,
       shipping_cents: normalized.shipping_cents,
@@ -1216,7 +1277,6 @@ async function processMessage(
       order_id: string | null;
       purchase_date: string;
       currency: string;
-      total_amount: number;
       total_cents: number;
       tax_cents: number | null;
       shipping_cents: number | null;
@@ -1235,7 +1295,7 @@ async function processMessage(
       order_id: row.order_id,
       purchase_date: row.purchase_date,
       currency: row.currency || "USD",
-      total_amount: row.total_amount,
+      total_cents: row.total_cents,
     });
 
     normalized.dedupe_key = row.dedupe_key;

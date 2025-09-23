@@ -1,6 +1,7 @@
 // lib/receipt-dedupe.ts
-// Assumes receipt totals arrive in major currency units so a static decimal map can convert to cents;
-// trade-off is expanding the list if we add exotic currencies, but this keeps dedupe keys consistent today.
+// Assumes upstream ingestion already normalizes totals into minor currency units so dedupe keys can
+// hash stable values; trade-off is depending on ingestion for currency scaling, but we avoid duplicating
+// multiplier logic here and keep canonicalization lightweight for every call site.
 
 import { createHash } from "crypto";
 
@@ -10,64 +11,26 @@ export interface ReceiptIdentity {
   order_id?: string | null;
   purchase_date?: string | null;
   currency?: string | null;
-  total_amount?: number | string | null;
+  total_cents?: number | string | null;
 }
-
-const ZERO_DECIMAL_CURRENCIES = new Set<string>([
-  "BIF",
-  "CLP",
-  "DJF",
-  "GNF",
-  "JPY",
-  "KMF",
-  "KRW",
-  "MGA",
-  "PYG",
-  "RWF",
-  "UGX",
-  "VND",
-  "VUV",
-  "XAF",
-  "XOF",
-  "XPF",
-]);
-
-const THREE_DECIMAL_CURRENCIES = new Set<string>(["BHD", "JOD", "KWD", "OMR", "TND"]);
 
 function resolveCurrencyCode(input?: string | null): string {
   const normalized = (input || "USD").toString().trim().toUpperCase();
   return normalized || "USD";
 }
 
-function resolveMultiplier(currency: string): number {
-  if (THREE_DECIMAL_CURRENCIES.has(currency)) {
-    return 1000;
-  }
-  if (ZERO_DECIMAL_CURRENCIES.has(currency)) {
-    return 1;
-  }
-  return 100;
-}
-
-function normalizeTotalCents(value: number | string | null | undefined, currency: string): number {
-  if (value == null) {
-    return 0;
-  }
-
-  const multiplier = resolveMultiplier(currency);
-
+function normalizeTotalCents(value: number | string | null | undefined): number {
   if (typeof value === "number") {
     if (!Number.isFinite(value)) return 0;
-    return Math.round(value * multiplier);
+    return Math.round(value);
   }
 
   if (typeof value === "string") {
-    const cleaned = value.replace(/[^0-9.,-]/g, "");
+    const cleaned = value.replace(/[^0-9-]/g, "");
     if (!cleaned) return 0;
-    const normalized = cleaned.replace(/,/g, "");
-    const parsed = Number.parseFloat(normalized);
+    const parsed = Number.parseInt(cleaned, 10);
     if (!Number.isFinite(parsed)) return 0;
-    return Math.round(parsed * multiplier);
+    return Math.round(parsed);
   }
 
   return 0;
@@ -86,7 +49,7 @@ export function canonicalizeReceipt(receipt: ReceiptIdentity): string {
   const orderId = (receipt.order_id || "").toString().trim();
   const currency = resolveCurrencyCode(receipt.currency);
   const purchaseDate = normalizeDateToIso(receipt.purchase_date);
-  const totalCents = normalizeTotalCents(receipt.total_amount ?? null, currency);
+  const totalCents = normalizeTotalCents(receipt.total_cents ?? null);
 
   return `${userId}|${merchant}|${orderId}|${purchaseDate}|${currency}|${totalCents}`;
 }

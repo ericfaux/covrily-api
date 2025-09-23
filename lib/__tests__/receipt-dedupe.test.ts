@@ -1,6 +1,7 @@
 // lib/__tests__/receipt-dedupe.test.ts
 // Assumes jest runs via ts-jest in ESM mode so we can exercise normalization logic; trade-off is
-// the extra dev dependency weight to assert canonicalization stays stable for ingestion dedupe keys.
+// the extra dev dependency weight to assert canonicalization stays stable for ingestion dedupe keys
+// while trusting ingestion to scale totals into minor units before they reach this helper.
 
 import { canonicalizeReceipt, makeDedupeKey } from "../receipt-dedupe.js";
 
@@ -12,7 +13,7 @@ describe("canonicalizeReceipt", () => {
       order_id: "  ABC-123  ",
       purchase_date: "2024-04-15T12:00:00Z",
       currency: "usd",
-      total_amount: "$1,234.56",
+      total_cents: " $1,234.56 ",
     });
 
     expect(canonical).toBe("user-123|bestbuy.com|ABC-123|2024-04-15|USD|123456");
@@ -25,7 +26,7 @@ describe("canonicalizeReceipt", () => {
       order_id: "JP-1",
       purchase_date: "2024-01-01",
       currency: "jpy",
-      total_amount: 5000,
+      total_cents: 5000,
     });
 
     const bhd = canonicalizeReceipt({
@@ -34,7 +35,7 @@ describe("canonicalizeReceipt", () => {
       order_id: "BH-1",
       purchase_date: "2024-01-01",
       currency: "BHD",
-      total_amount: 12.345,
+      total_cents: 12345,
     });
 
     expect(jpy.endsWith("|JPY|5000")).toBe(true);
@@ -50,7 +51,7 @@ describe("makeDedupeKey", () => {
       order_id: "XYZ",
       purchase_date: "2024-05-01",
       currency: "usd",
-      total_amount: "49.99",
+      total_cents: "4999",
     });
 
     const second = makeDedupeKey({
@@ -59,7 +60,7 @@ describe("makeDedupeKey", () => {
       order_id: " XYZ ",
       purchase_date: "2024-05-01T08:00:00-04:00",
       currency: "USD",
-      total_amount: 49.99,
+      total_cents: 4999,
     });
 
     expect(first).toBe(second);
