@@ -7,6 +7,10 @@
 // telemetry matches parser truth while backfilling gaps with heuristics when parsers omit metadata.
 // Fetch Gmail messages for approved merchants and store receipts
 
+import type {
+  PostgrestError,
+  PostgrestMaybeSingleResponse,
+} from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { google } from "googleapis";
 import parsePdf from "../../lib/pdf.js";
@@ -150,6 +154,27 @@ function sanitizeKey(value: string): string {
     .replace(/[^a-z0-9.@ ]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+export function normalizeOrderIdValue(value: unknown): string | null {
+  // Keep Supabase rows aligned with the legacy unique constraint by dropping placeholder IDs.
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "-") {
+    return null;
+  }
+  return trimmed;
+}
+
+const RECEIPT_CONFLICT_TARGETS = [
+  "user_id,merchant,order_id,purchase_date",
+  "user_id,merchant,order_id",
+] as const;
+
+export function isMissingConflictConstraint(
+  error: Pick<PostgrestError, "code"> | null | undefined,
+): boolean {
+  return Boolean(error?.code && error.code === "42P10");
 }
 
 function getMerchantDomains(raw: string): string[] {
@@ -1309,7 +1334,10 @@ async function processMessage(
         : null;
 
     const merchantForRow = normalized.merchant;
-    const orderIdForRow = normalized.order_id || null;
+    const orderIdForRow =
+      normalizeOrderIdValue(parsed?.order_id ?? null) ??
+      normalizeOrderIdValue(normalized.order_id) ??
+      null;
     const purchaseDateForRow = normalized.purchase_date;
     const currencyForRow = normalized.currency || "USD";
     const dedupeKey = makeDedupeKey({
@@ -1366,19 +1394,61 @@ async function processMessage(
     }
     const existingRow = existingQuery.data;
 
-    const upsertResult = await supabaseAdmin
-      .from("receipts")
-      .upsert(row, { onConflict: "user_id,dedupe_key" })
-      .select("id")
-      .maybeSingle();
+    let upsertResult: PostgrestMaybeSingleResponse<{ id: string | null }> | null = null;
+    let conflictTargetUsed: (typeof RECEIPT_CONFLICT_TARGETS)[number] | null = null;
+    let lastUpsertError: PostgrestError | null = null;
 
-    if (upsertResult.error) {
+    for (const conflictTarget of RECEIPT_CONFLICT_TARGETS) {
+      const attempt = await supabaseAdmin
+        .from("receipts")
+        .upsert(row, { onConflict: conflictTarget })
+        .select("id")
+        .maybeSingle();
+
+      if (!attempt.error) {
+        upsertResult = attempt;
+        conflictTargetUsed = conflictTarget;
+        break;
+      }
+
+      lastUpsertError = attempt.error;
+      const logContext = {
+        user_id: row.user_id,
+        dedupe_key: row.dedupe_key,
+        merchant: row.merchant,
+        order_id: row.order_id,
+        purchase_date: row.purchase_date,
+        conflict_target: conflictTarget,
+        error: attempt.error,
+      } as const;
+
+      if (isMissingConflictConstraint(attempt.error)) {
+        console.warn("[receipts upsert]", {
+          ...logContext,
+          warning: "missing_conflict_constraint",
+        });
+        continue;
+      }
+
+      console.error("[receipts upsert]", logContext);
+      throw new ReceiptUpsertError(row.user_id, row.dedupe_key, attempt.error);
+    }
+
+    if (!upsertResult || !conflictTargetUsed) {
       console.error("[receipts upsert]", {
         user_id: row.user_id,
         dedupe_key: row.dedupe_key,
-        error: upsertResult.error,
+        merchant: row.merchant,
+        order_id: row.order_id,
+        purchase_date: row.purchase_date,
+        attempted_conflict_targets: RECEIPT_CONFLICT_TARGETS,
+        error: lastUpsertError,
       });
-      throw new ReceiptUpsertError(row.user_id, row.dedupe_key, upsertResult.error);
+      throw new ReceiptUpsertError(
+        row.user_id,
+        row.dedupe_key,
+        lastUpsertError || new Error("receipt upsert conflict targets exhausted"),
+      );
     }
 
     const receiptId = upsertResult.data?.id || existingRow?.id || null;
@@ -1389,6 +1459,7 @@ async function processMessage(
       merchant: normalized.merchant,
       dedupe_key: normalized.dedupe_key,
       created: !existingRow && !!receiptId,
+      conflict_target: conflictTargetUsed,
     });
 
     if (receiptId) {
