@@ -1319,7 +1319,10 @@ async function processMessage(
         : null;
 
     const merchantForRow = normalized.merchant;
-    const orderIdForRow =
+    const rawParsedOrderId =
+      typeof parsed?.order_id === "string" ? parsed.order_id.trim() : "";
+    const orderIdForRow = rawParsedOrderId || null;
+    const orderIdForDedupe =
       normalizeOrderIdValue(parsed?.order_id ?? null) ??
       normalizeOrderIdValue(normalized.order_id) ??
       null;
@@ -1328,11 +1331,19 @@ async function processMessage(
     const dedupeKey = makeDedupeKey({
       user_id: userId,
       merchant: merchantForRow,
-      order_id: orderIdForRow,
+      order_id: orderIdForDedupe,
       purchase_date: purchaseDateForRow,
       currency: currencyForRow,
       total_cents: resolvedTotalCents,
     });
+
+    if (!dedupeKey.trim()) {
+      console.error("[receipts dedupe]", {
+        user_id: userId,
+        error: new Error("missing dedupe key"),
+      });
+      return false;
+    }
 
     const row: {
       user_id: string;
@@ -1379,25 +1390,38 @@ async function processMessage(
     }
     const existingRow = existingQuery.data;
 
-    const upsertResult = await supabaseAdmin
+    const { error: upsertError } = await supabaseAdmin
       .from("receipts")
-      .upsert(row, { onConflict: "user_id,merchant,order_id,purchase_date" })
-      .select("id")
-      .maybeSingle();
+      .upsert(row, { onConflict: "user_id,dedupe_key" });
 
-    if (upsertResult.error) {
+    if (upsertError) {
       console.error("[receipts upsert]", {
         user_id: row.user_id,
         dedupe_key: row.dedupe_key,
-        merchant: row.merchant,
-        order_id: row.order_id,
-        purchase_date: row.purchase_date,
-        error: upsertResult.error,
+        error: upsertError,
       });
-      throw new ReceiptUpsertError(row.user_id, row.dedupe_key, upsertResult.error);
+      throw new ReceiptUpsertError(row.user_id, row.dedupe_key, upsertError);
     }
 
-    const receiptId = upsertResult.data?.id || existingRow?.id || null;
+    let receiptId: string | null = existingRow?.id ?? null;
+
+    if (!receiptId) {
+      const insertedQuery = await supabaseAdmin
+        .from("receipts")
+        .select("id")
+        .eq("user_id", row.user_id)
+        .eq("dedupe_key", row.dedupe_key)
+        .maybeSingle();
+      if (insertedQuery.error) {
+        console.error("[receipts select]", {
+          user_id: row.user_id,
+          dedupe_key: row.dedupe_key,
+          error: insertedQuery.error,
+        });
+        throw insertedQuery.error;
+      }
+      receiptId = insertedQuery.data?.id ?? null;
+    }
 
     console.info("[gmail][ingest]", {
       event: "receipt_upsert",
@@ -1779,7 +1803,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
     if (err instanceof ReceiptUpsertError) {
-      return res.status(err.statusCode).json({ ok: false, error: err.code });
+      return res
+        .status(500)
+        .json({ ok: false, error: "receipts_upsert_failed" });
     }
     console.error("[gmail] ingest failed", err);
     return res.status(500).json({ ok: false, error: "internal_error" });
