@@ -1,192 +1,117 @@
-// api/gmail/merchants.ts
-// Assumes Gmail discovery returns domains or sender ids that can safely backfill display names;
-// trade-off is deriving a best-effort pretty label locally to keep the UI readable without storing
-// additional metadata in Supabase.
+// PATH: api/gmail/merchants.ts
+// Assumes callers either pass a Supabase session JWT or an explicit user param; trade-off is handling
+// both flows during transition so we can gradually remove the insecure query parameter once clients
+// adopt authenticated requests.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import {
-  getAccessToken,
-  scanGmailMerchants,
-  type MerchantDiscoveryItem,
-  type MerchantDiscoverySource,
-} from "../../lib/gmail-scan.js";
+import { ReauthorizeNeeded, ensureAccessToken, listLikelyMerchants } from "../../lib/gmail.js";
 import { saveApprovedMerchants } from "../../lib/merchants.js";
 import { supabaseAdmin } from "../../lib/supabase-admin.js";
 
-interface NormalizedMerchant {
-  id: string;
-  name: string;
-  est_count?: number;
-  source?: MerchantDiscoverySource;
-}
-
-type MerchantInput =
-  | MerchantDiscoveryItem
-  | string
-  | {
-      id?: string | null;
-      domain?: string | null;
-      name?: string | null;
-      est_count?: number | null;
-      source?: string | null;
-    };
-
-function prettyNameFromId(id: string): string {
-  const trimmed = id.trim().toLowerCase();
-  if (!trimmed) return id;
-  const withoutTld = trimmed.replace(/\.(com|net|org|co|io|store|shop)$/i, "");
-  const segments = withoutTld.split(".");
-  const primary = segments[0] || trimmed;
-  return primary
-    .split(/[-_]/)
-    .map((part) => (part ? part[0].toUpperCase() + part.slice(1) : ""))
-    .filter(Boolean)
-    .join(" ") || id;
-}
-
-function normalizeMerchants(items: MerchantInput[]): NormalizedMerchant[] {
-  const deduped = new Map<string, NormalizedMerchant>();
-  for (const entry of items) {
-    if (!entry) continue;
-    let id: string | null = null;
-    let name: string | null = null;
-    let estCount: number | null = null;
-    let source: MerchantDiscoverySource | undefined;
-
-    if (typeof entry === "string") {
-      id = entry;
-    } else {
-      const candidate: any = entry;
-      if (typeof candidate.id === "string") {
-        id = candidate.id;
-      } else if (typeof candidate.domain === "string") {
-        id = candidate.domain;
-      }
-      if (typeof candidate.name === "string") name = candidate.name;
-      if (typeof candidate.est_count === "number" && Number.isFinite(candidate.est_count)) {
-        estCount = candidate.est_count;
-      }
-      if (candidate.source === "smartlabel" || candidate.source === "heuristic") {
-        source = candidate.source;
-      }
-    }
-
-    if (!id) continue;
-    const normalizedId = id.trim().toLowerCase();
-    if (!normalizedId) continue;
-
-    const displayName = (name || "").trim() || prettyNameFromId(normalizedId);
-    const existing = deduped.get(normalizedId);
-    if (existing) {
-      // Merge duplicates so domains stay unique while preserving count and best source.
-      if (typeof estCount === "number") {
-        const current = existing.est_count ?? 0;
-        existing.est_count = current + estCount;
-      }
-      if (!existing.name && displayName) {
-        existing.name = displayName;
-      }
-      if (source === "smartlabel" && existing.source !== "smartlabel") {
-        existing.source = "smartlabel";
-      } else if (!existing.source && source) {
-        existing.source = source;
-      }
-      continue;
-    }
-
-    const record: NormalizedMerchant = {
-      id: normalizedId,
-      name: displayName,
-    };
-    if (typeof estCount === "number") record.est_count = estCount;
-    if (source) record.source = source;
-    deduped.set(normalizedId, record);
+async function resolveUserId(req: VercelRequest): Promise<string | null> {
+  const queryUser = typeof req.query.user === "string" ? req.query.user.trim() : "";
+  if (queryUser) {
+    return queryUser;
   }
 
-  return Array.from(deduped.values());
-}
-
-function normalizeMerchantIds(values: any[]): string[] {
-  const ids = new Set<string>();
-  for (const value of values) {
-    if (!value) continue;
-    let id: string | null = null;
-    if (typeof value === "string") {
-      id = value;
-    } else if (typeof value === "object") {
-      const candidate: any = value;
-      if (typeof candidate.id === "string") {
-        id = candidate.id;
-      } else if (typeof candidate.domain === "string") {
-        id = candidate.domain;
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  if (typeof authHeader === "string") {
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (match) {
+      const token = match[1];
+      const { data, error } = await supabaseAdmin.auth.getUser(token);
+      if (!error && data?.user?.id) {
+        return data.user.id;
       }
     }
-    if (!id) continue;
-    const normalized = id.trim().toLowerCase();
-    if (normalized) ids.add(normalized);
   }
-  return Array.from(ids);
+
+  return null;
+}
+
+function parseJsonBody<T = any>(req: VercelRequest): T | null {
+  if (!req.body) return null;
+  if (typeof req.body === "string") {
+    try {
+      return JSON.parse(req.body) as T;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof req.body === "object") {
+    return req.body as T;
+  }
+  return null;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
+    const user = await resolveUserId(req);
+    if (!user) {
+      return res.status(401).json({ ok: false, error: "missing user", reauthorize: false });
+    }
+
     if (req.method === "GET") {
-      const user = (req.query.user as string) || "";
-      if (!user) return res.status(400).json({ ok: false, error: "missing user" });
-
-      const tokens = await getAccessToken(user);
-      const status = tokens?.status ? String(tokens.status).toLowerCase() : null;
-      if (!tokens || !tokens.accessToken || status === "reauth_required") {
-        return res.status(428).json({
-          ok: false,
-          code: "reauth_required",
-        });
-      }
-
-      const { merchants } = await scanGmailMerchants(user, tokens);
-      const normalized = normalizeMerchants(merchants);
-
-      const deleteResult = await supabaseAdmin
-        .from("auth_merchants")
-        .delete()
-        .eq("user_id", user);
-      if (deleteResult.error) {
-        console.error("[auth_merchants delete]", { user, error: deleteResult.error });
-        throw deleteResult.error;
-      }
-      if (normalized.length > 0) {
-        const payload = normalized.map((item) => ({
-          // Only persist identifiers because auth_merchants schema currently exposes
-          // { user_id, merchant }. Additional metadata stays in memory for UI rendering.
-          user_id: user,
-          merchant: item.id,
-        }));
-        const { error } = await supabaseAdmin
-          .from("auth_merchants")
-          .upsert(payload, { onConflict: "user_id,merchant" });
-        if (error) {
-          console.error("[auth_merchants upsert]", { user, error });
-          throw error;
+      try {
+        const { expiresAt } = await ensureAccessToken(user);
+        return res.status(200).json({ ok: true, user, expiresAt });
+      } catch (err) {
+        if (err instanceof ReauthorizeNeeded) {
+          return res.status(401).json({ ok: false, reauthorize: true });
         }
+        console.error("[gmail] probe failed", err);
+        return res.status(500).json({ ok: false, error: "internal_error", reauthorize: false });
       }
-
-      return res.status(200).json({ ok: true, merchants: normalized });
     }
 
     if (req.method === "POST") {
-      const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-      const { user, merchants } = body || {};
-      if (!user || !Array.isArray(merchants)) {
-        return res.status(400).json({ ok: false, error: "missing user or merchants" });
+      const body = parseJsonBody(req) || {};
+
+      if (Array.isArray((body as any).merchants)) {
+        try {
+          const merchantIds = ((body as any).merchants as any[])
+            .map((value) => (typeof value === "string" ? value.trim() : ""))
+            .filter((value) => value.length > 0);
+          await saveApprovedMerchants(user, merchantIds);
+          return res.status(200).json({ ok: true });
+        } catch (err) {
+          console.error("[gmail] save merchants failed", err);
+          return res.status(500).json({ ok: false, error: "internal_error", reauthorize: false });
+        }
       }
 
-      const merchantIds = normalizeMerchantIds(merchants);
-      await saveApprovedMerchants(user, merchantIds);
-      return res.status(200).json({ ok: true });
+      const lookbackValue = Number((body as any).lookbackDays);
+      const maxMessagesValue = Number((body as any).maxMessages);
+      const lookbackDays = Number.isFinite(lookbackValue) ? lookbackValue : 90;
+      const maxMessages = Number.isFinite(maxMessagesValue) ? maxMessagesValue : 50;
+
+      let expiresAt: string | null = null;
+      try {
+        const tokenInfo = await ensureAccessToken(user);
+        expiresAt = tokenInfo.expiresAt;
+      } catch (err) {
+        if (err instanceof ReauthorizeNeeded) {
+          return res.status(401).json({ ok: false, reauthorize: true });
+        }
+        console.error("[gmail] ensure token failed", err);
+        return res.status(500).json({ ok: false, error: "internal_error", reauthorize: false });
+      }
+
+      try {
+        const merchants = await listLikelyMerchants(user, lookbackDays, maxMessages);
+        return res.status(200).json({ ok: true, user, expiresAt, merchants });
+      } catch (err) {
+        if (err instanceof ReauthorizeNeeded) {
+          return res.status(401).json({ ok: false, reauthorize: true });
+        }
+        console.error("[gmail] list merchants failed", err);
+        return res.status(500).json({ ok: false, error: "internal_error", reauthorize: false });
+      }
     }
 
     res.setHeader("Allow", "GET,POST");
-    res.status(405).end();
+    return res.status(405).end();
   } catch (e: any) {
-    res.status(400).json({ ok: false, error: String(e?.message || e) });
+    console.error("[gmail] merchants handler error", e);
+    return res.status(500).json({ ok: false, error: "internal_error", reauthorize: false });
   }
 }
