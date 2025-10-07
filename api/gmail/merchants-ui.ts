@@ -1,8 +1,7 @@
-// api/gmail/merchants-ui.ts
-// Assumes merchant payloads provide stable ids and human-friendly names; trade-off is handling
-// legacy string responses in the client so the checkbox list stays usable during rollout, and we
-// now surface ingest failures by echoing the raw response text so troubleshooting is easier even
-// though the UI may show less-polished error strings.
+// PATH: api/gmail/merchants-ui.ts
+// Assumes transitional UI continues to rely on query-string user ids; trade-off is keeping the
+// lightweight HTML helper available for manual testing even though new authenticated flows should
+// migrate to the JSON API directly.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -46,10 +45,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return { id, name: id };
       }
       if (typeof raw === 'object') {
-        const id = typeof raw.id === 'string' ? raw.id : typeof raw.domain === 'string' ? raw.domain : null;
+        const id = typeof raw.domain === 'string' ? raw.domain : typeof raw.id === 'string' ? raw.id : null;
         if (!id) return null;
-        const name = typeof raw.name === 'string' && raw.name.trim().length > 0 ? raw.name.trim() : id;
-        return { id, name };
+        const name = typeof raw.merchant === 'string' && raw.merchant.trim().length > 0 ? raw.merchant.trim() : id;
+        const count = typeof raw.count === 'number' ? raw.count : null;
+        const label = count && count > 1 ? name + ' (' + count + ')' : name;
+        return { id, name: label };
       }
       return null;
     }
@@ -58,18 +59,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const list = document.getElementById('list');
       list.innerHTML = '<p>Loading...</p>';
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 30000);
-        const r = await fetch('/api/gmail/merchants?user=' + encodeURIComponent(user), { signal: controller.signal });
-        clearTimeout(timeout);
-        if (r.status === 428) {
-          window.location.href = '/api/gmail/ui?user=' + encodeURIComponent(user);
-          return;
+        const probeResp = await fetch('/api/gmail/merchants?user=' + encodeURIComponent(user));
+        if (probeResp.status === 401) {
+          const payload = await probeResp.json().catch(() => ({}));
+          if (payload && payload.reauthorize) {
+            window.location.href = '/api/gmail/ui?user=' + encodeURIComponent(user);
+            return;
+          }
+          throw new Error('probe_failed');
         }
-        if (!r.ok) {
-          throw new Error('failed to load');
+        if (!probeResp.ok) {
+          throw new Error('probe_failed');
         }
-        const data = await r.json();
+
+        const discoveryResp = await fetch('/api/gmail/merchants?user=' + encodeURIComponent(user), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lookbackDays: 90, maxMessages: 50 })
+        });
+        if (discoveryResp.status === 401) {
+          const payload = await discoveryResp.json().catch(() => ({}));
+          if (payload && payload.reauthorize) {
+            window.location.href = '/api/gmail/ui?user=' + encodeURIComponent(user);
+            return;
+          }
+          throw new Error('discovery_failed');
+        }
+        if (!discoveryResp.ok) {
+          throw new Error('discovery_failed');
+        }
+        const data = await discoveryResp.json();
         const merchants = Array.isArray(data.merchants) ? data.merchants : [];
         if (merchants.length === 0) {
           list.innerHTML = '<p>No merchants found.</p>';

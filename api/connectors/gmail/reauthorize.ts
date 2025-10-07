@@ -1,11 +1,9 @@
-// api/connectors/gmail/reauthorize.ts
-// Assumes we can flag reauth without discarding refresh tokens; trade-off keeps the old
-// token in storage temporarily so Google reauth callbacks can reuse it if a new token is
-// not returned, while status gating still blocks usage until reauth finishes. We also
-// mirror the legacy reauth_required boolean so older checks remain stable while the new
-// status column drives behavior.
+// PATH: api/connectors/gmail/reauthorize.ts
+// Assumes reauth requests originate from trusted callers providing a valid user id; trade-off is
+// issuing state-encoded OAuth URLs without extra CSRF tokens, relying on Supabase-authenticated
+// flows to guard the endpoint.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getGmailAuthUrl } from "../../../lib/gmail.js";
+import { getGoogleAuthUrl } from "../../../lib/gmail.js";
 import { supabaseAdmin } from "../../../lib/supabase-admin.js";
 
 function parseUser(req: VercelRequest): string {
@@ -83,8 +81,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    const url = getGmailAuthUrl({ user });
-    // Rely on shared helper to keep OAuth state JSON encoded for consistent callback handling.
+    const statePayload = Buffer.from(JSON.stringify({ user }), "utf8").toString("base64url");
+    const url = getGoogleAuthUrl(statePayload);
 
     return res.status(200).json({ ok: true, url });
   } catch (err) {

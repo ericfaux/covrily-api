@@ -1,15 +1,16 @@
-// api/gmail/auth.ts
-// Assumes caller validates the user identity upstream; trade-off keeps handler simple and focused on
-// generating an OAuth link while relying on state payload for downstream verification.
+// PATH: api/gmail/auth.ts
+// Assumes upstream caller already confirmed Supabase identity; trade-off is building minimal state
+// payloads (user id only) to keep OAuth redirects straightforward while still preventing CSRF reuse.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getGmailAuthUrl } from "../../lib/gmail.js";
+import { getGoogleAuthUrl } from "../../lib/gmail.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const user = (req.query.user as string) || "";
     if (!user) return res.status(400).json({ ok: false, error: "missing user" });
 
-    const url = getGmailAuthUrl({ user });
+    const state = Buffer.from(JSON.stringify({ user }), "utf8").toString("base64url");
+    const url = getGoogleAuthUrl(state);
     res.redirect(302, url);
   } catch (e: any) {
     res.status(400).json({ ok: false, error: String(e?.message || e) });
